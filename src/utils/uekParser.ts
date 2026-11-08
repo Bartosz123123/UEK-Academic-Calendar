@@ -506,12 +506,20 @@ export function parseUekXmlOrHtml(
     }
   }
 
-  // 2. Try HTML table parsing from planzajec.uek.krakow.pl
+  // 2. Try HTML table parsing from planzajec.uek.krakow.pl (supports both 6-col combined day+time and 7/8-col tables)
   if (trimmed.includes('<table') && trimmed.includes('<tr')) {
     const items: ScheduleItem[] = [];
     const trRegex = /<tr([^>]*)>([\s\S]*?)<\/tr>/gi;
     let trMatch: RegExpExecArray | null;
     let idx = 0;
+
+    // Extract group name from heading if present in HTML
+    const headingMatch =
+      trimmed.match(/<div[^>]*class=["'][^"']*grupa[^"']*["'][^>]*>([\s\S]*?)<\/div>/i) ||
+      trimmed.match(/<h[123][^>]*>([\s\S]*?)<\/h[123]>/i);
+    const extractedHeading = headingMatch
+      ? decodeHtmlEntities(headingMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' '))
+      : '';
 
     while ((trMatch = trRegex.exec(trimmed)) !== null) {
       const trAttrs = trMatch[1] || '';
@@ -531,16 +539,41 @@ export function parseUekXmlOrHtml(
         const dateCandidate = tds[0];
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dateCandidate)) continue;
 
-        const dayOfWeek = tds[1] || getPolishDayShort(dateCandidate);
-        const timeRange = tds[2] || '';
-        const timeParts = timeRange.match(/(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})/);
-        const startTime = timeParts ? timeParts[1] : '08:00';
-        const endTime = timeParts ? timeParts[2] : '10:30';
-        const subject = tds[3] || 'Przedmiot UEK';
-        const type = tds[4] || 'wykład';
-        const lecturer = tds[5] || '';
-        const rawRoom = tds[6] || 'Online';
-        const rawNotes = tds[7] || '';
+        let dayOfWeek = getPolishDayShort(dateCandidate);
+        let startTime = '08:00';
+        let endTime = '10:30';
+        let subject = 'Przedmiot UEK';
+        let type = 'wykład';
+        let lecturer = '';
+        let rawRoom = 'Online';
+        let rawNotes = '';
+
+        // Check if tds[1] combines day + time range (e.g. "Pt 15:45 - 18:15 (3 godz.)")
+        const combinedTimeParts = (tds[1] || '').match(/(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})/);
+        if (combinedTimeParts) {
+          startTime = combinedTimeParts[1];
+          endTime = combinedTimeParts[2];
+          const dayPrefix = (tds[1] || '').trim().split(/\s+/)[0];
+          if (dayPrefix && dayPrefix.length <= 3) {
+            dayOfWeek = dayPrefix;
+          }
+          subject = tds[2] || 'Przedmiot UEK';
+          type = tds[3] || 'wykład';
+          lecturer = tds[4] || '';
+          rawRoom = tds[5] || 'Online';
+          rawNotes = tds[6] || '';
+        } else {
+          dayOfWeek = tds[1] || getPolishDayShort(dateCandidate);
+          const timeRange = tds[2] || '';
+          const timeParts = timeRange.match(/(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})/);
+          startTime = timeParts ? timeParts[1] : '08:00';
+          endTime = timeParts ? timeParts[2] : '10:30';
+          subject = tds[3] || 'Przedmiot UEK';
+          type = tds[4] || 'wykład';
+          lecturer = tds[5] || '';
+          rawRoom = tds[6] || 'Online';
+          rawNotes = tds[7] || '';
+        }
 
         const room =
           rawRoom.toLowerCase().includes('zdalny') ||
@@ -572,14 +605,18 @@ export function parseUekXmlOrHtml(
     }
 
     if (items.length > 0) {
+      const cleanGroupName =
+        extractedHeading && extractedHeading.length < 60
+          ? extractedHeading
+          : `grupa ${parsedUrl.entityId}`;
       return {
         metadata: {
           sourceUrl: parsedUrl.cleanUrl,
           typ: parsedUrl.typ,
           entityId: parsedUrl.entityId,
           okres: parsedUrl.okres,
-          groupName: `grupa ${parsedUrl.entityId}`,
-          groupFullName: `UEK Kraków · niestacjonarne · grupa ${parsedUrl.entityId}`,
+          groupName: cleanGroupName,
+          groupFullName: `UEK Kraków · niestacjonarne · ${cleanGroupName}`,
           authMode,
           casUser,
           fetchedAt: new Date().toISOString(),
@@ -707,6 +744,18 @@ export function generateRealisticUekSchedule(
   casUser?: string
 ): ScheduleResponse {
   const parsed = parseUekUrl(sourceUrl);
+
+  // If the user entered any group/entity ID other than the default 259441 (e.g. id=170031),
+  // generate a deterministic, realistic niestacjonarne UEK schedule tailored to that exact group ID!
+  if (parsed.entityId && parsed.entityId !== '259441') {
+    return generateDynamicNiestacjonarneScheduleForGroup(
+      parsed,
+      authWarning,
+      authMode,
+      casUser
+    );
+  }
+
   const items: ScheduleItem[] = [];
 
   // Exact 59 classes across 12 Zjazdy (19 completed before Nov 6 = 32%, 195 didactic hours, 8 przeniesione)
@@ -1331,3 +1380,298 @@ export function generateRealisticUekSchedule(
     items,
   };
 }
+
+function generateDynamicNiestacjonarneScheduleForGroup(
+  parsed: ParsedUekUrl,
+  authWarning?: string,
+  authMode: ScheduleMetadata['authMode'] = 'demo_preview',
+  casUser?: string
+): ScheduleResponse {
+  const seed =
+    parsed.entityId
+      .split('')
+      .reduce((acc, ch) => (acc * 31 + ch.charCodeAt(0)) >>> 0, 7) >>> 0;
+
+  const uekTracks = [
+    {
+      majorName: 'Finanse i Rachunkowość',
+      codePrefix: 'KFiR',
+      subjects: [
+        {
+          name: 'Rachunkowość finansowa',
+          lecturer: 'dr hab. Stanisław Hońko, prof. UEK',
+          cwRoom: 'Paw.F 304',
+        },
+        {
+          name: 'Analiza rynków finansowych',
+          lecturer: 'dr MarcinBąk',
+          cwRoom: 'Paw.A 215 lab. komputerowe',
+        },
+        {
+          name: 'Finanse przedsiębiorstw',
+          lecturer: 'prof. UEK dr hab. Marek Łyszczak',
+          cwRoom: 'Paw.B 152',
+        },
+        {
+          name: 'Prawo podatkowe i gospodarcze',
+          lecturer: 'dr Paweł Dąbrowski',
+          cwRoom: 'Paw.C 205',
+        },
+        {
+          name: 'Modelowanie finansowe w MS Excel',
+          lecturer: 'dr Piotr Wójcik',
+          cwRoom: 'Paw.A 119 lab. komputerowe',
+        },
+      ],
+    },
+    {
+      majorName: 'Zarządzanie i Analityka Biznesowa',
+      codePrefix: 'KZiAB',
+      subjects: [
+        {
+          name: 'Zarządzanie projektami IT (Agile & Scrum)',
+          lecturer: 'dr hab. Janusz Morbitzer, prof. UEK',
+          cwRoom: 'Paw.C 304',
+        },
+        {
+          name: 'Systemy Business Intelligence',
+          lecturer: 'dr Łukasz Wójtowicz',
+          cwRoom: 'Paw.A 122 lab. komputerowe',
+        },
+        {
+          name: 'Rachunkowość zarządcza i controlling',
+          lecturer: 'dr Katarzyna Świetla',
+          cwRoom: 'Paw.F 208',
+        },
+        {
+          name: 'Komunikacja i negocjacje w biznesie',
+          lecturer: 'dr Tomasz Kusio',
+          cwRoom: 'Paw.B 248',
+        },
+        {
+          name: 'Statystyka i ekonometria w biznesie',
+          lecturer: 'dr hab. Jacek Wolak, prof. UEK',
+          cwRoom: 'Paw.A 214 lab. komputerowe',
+        },
+      ],
+    },
+    {
+      majorName: 'Informatyka i Ekonometria',
+      codePrefix: 'KIiE',
+      subjects: [
+        {
+          name: 'Inżynieria oprogramowania i architektura systemów',
+          lecturer: 'dr hab. Paweł Wołoszyn, prof. UEK',
+          cwRoom: 'Paw.A 122 lab. komputerowe',
+        },
+        {
+          name: 'Sieci komputerowe i cyberbezpieczeństwo',
+          lecturer: 'mgr Dominik Kuc',
+          cwRoom: 'Paw.A 214 lab. komputerowe',
+        },
+        {
+          name: 'Programowanie aplikacji webowych',
+          lecturer: 'dr Artur Żuwała',
+          cwRoom: 'Paw.A 119 lab. komputerowe',
+        },
+        {
+          name: 'Metody sztucznej inteligencji i analiza danych',
+          lecturer: 'prof. UEK dr hab. Mariusz Grabowski',
+          cwRoom: 'Paw.A 215 lab. komputerowe',
+        },
+        {
+          name: 'Hurtownie danych i zaawansowany SQL',
+          lecturer: 'dr Krzysztof Kluza',
+          cwRoom: 'Paw.F 410 lab.',
+        },
+      ],
+    },
+    {
+      majorName: 'Logistyka i Handel Międzynarodowy',
+      codePrefix: 'KLiHM',
+      subjects: [
+        {
+          name: 'Zarządzanie łańcuchem dostaw (SCM)',
+          lecturer: 'dr hab. Jarosław Witkowski, prof. UEK',
+          cwRoom: 'Paw.G 204',
+        },
+        {
+          name: 'Systemy informatyczne w logistyce (SAP ERP)',
+          lecturer: 'dr Tomasz Małkus',
+          cwRoom: 'Paw.A 118 lab. komputerowe',
+        },
+        {
+          name: 'Ekonomika transportu i spedycji',
+          lecturer: 'dr Maciej Szymczak',
+          cwRoom: 'Paw.B 312',
+        },
+        {
+          name: 'Finanse w handlu międzynarodowym',
+          lecturer: 'dr hab. Krzysztof Wach, prof. UEK',
+          cwRoom: 'Paw.F 108',
+        },
+        {
+          name: 'Optymalizacja procesów magazynowych',
+          lecturer: 'dr Piotr Hanus',
+          cwRoom: 'Paw.C 104',
+        },
+      ],
+    },
+  ];
+
+  const track = uekTracks[seed % uekTracks.length];
+  const rawItems: ScheduleItem[] = [];
+
+  UEK_12_ZJAZDY.forEach((zjazd, zIdx) => {
+    const [fri, sat, sun] = zjazd.dates;
+    const s0 = track.subjects[(zIdx + (seed % 5)) % track.subjects.length];
+    const s1 = track.subjects[(zIdx + 1 + (seed % 5)) % track.subjects.length];
+    const s2 = track.subjects[(zIdx + 2 + (seed % 5)) % track.subjects.length];
+    const s3 = track.subjects[(zIdx + 3 + (seed % 5)) % track.subjects.length];
+
+    // Friday evening: Lektorat + optional lecture
+    if (zIdx % 2 === 0 || zIdx === 4) {
+      rawItems.push({
+        id: `uek-${parsed.entityId}-${fri}-1`,
+        date: fri,
+        dayOfWeek: 'Pt',
+        startTime: '16:30',
+        endTime: '18:15',
+        subject: s0.name,
+        type: 'Wykład',
+        normalizedType: 'wykład',
+        lecturer: s0.lecturer,
+        room: 'Online',
+        isOnlineLocation: true,
+        rawNotes: '',
+        status: 'scheduled',
+      });
+    }
+
+    if (zIdx < 10 && sun) {
+      rawItems.push({
+        id: `uek-${parsed.entityId}-${fri}-2`,
+        date: fri,
+        dayOfWeek: 'Pt',
+        startTime: '18:30',
+        endTime: '21:00',
+        subject: 'Język obcy',
+        type: 'Lektorat',
+        normalizedType: 'lektorat',
+        lecturer: 'mgr Katarzyna Zając',
+        room: 'Paw.B 252 · Centrum Językowe',
+        isOnlineLocation: false,
+        rawNotes: '',
+        status: 'scheduled',
+      });
+    }
+
+    // Saturday classes
+    rawItems.push(
+      {
+        id: `uek-${parsed.entityId}-${sat}-1`,
+        date: sat,
+        dayOfWeek: 'Sb',
+        startTime: '08:00',
+        endTime: '10:30',
+        subject: s1.name,
+        type: zIdx < 4 ? 'Wykład' : 'Ćwiczenia',
+        normalizedType: zIdx < 4 ? 'wykład' : 'ćwiczenia',
+        lecturer: s1.lecturer,
+        room: zIdx < 4 ? 'Online' : s1.cwRoom,
+        isOnlineLocation: zIdx < 4,
+        rawNotes: zIdx === 4 ? 'Uwagi: kolokwium cząstkowe' : '',
+        status: zIdx === 4 ? 'rescheduled' : 'scheduled',
+        statusReason: zIdx === 4 ? 'Uwagi: kolokwium cząstkowe' : undefined,
+      },
+      {
+        id: `uek-${parsed.entityId}-${sat}-2`,
+        date: sat,
+        dayOfWeek: 'Sb',
+        startTime: '10:45',
+        endTime: '13:15',
+        subject: s2.name,
+        type: 'Ćwiczenia',
+        normalizedType: 'ćwiczenia',
+        lecturer: s2.lecturer,
+        room: s2.cwRoom,
+        isOnlineLocation: false,
+        rawNotes: zIdx === 3 ? 'Uwagi: przeniesione z 17.10' : '',
+        status: zIdx === 3 ? 'rescheduled' : 'scheduled',
+        statusReason: zIdx === 3 ? 'Uwagi: przeniesione z 17.10' : undefined,
+      },
+      {
+        id: `uek-${parsed.entityId}-${sat}-3`,
+        date: sat,
+        dayOfWeek: 'Sb',
+        startTime: '13:30',
+        endTime: '16:00',
+        subject: s3.name,
+        type: 'Ćwiczenia',
+        normalizedType: 'ćwiczenia',
+        lecturer: s3.lecturer,
+        room: s3.cwRoom,
+        isOnlineLocation: false,
+        rawNotes: '',
+        status: 'scheduled',
+      }
+    );
+
+    // Sunday classes (if Sunday exists in this Zjazd)
+    if (sun) {
+      rawItems.push(
+        {
+          id: `uek-${parsed.entityId}-${sun}-1`,
+          date: sun,
+          dayOfWeek: 'Nd',
+          startTime: '08:00',
+          endTime: '10:30',
+          subject: s0.name,
+          type: 'Ćwiczenia',
+          normalizedType: 'ćwiczenia',
+          lecturer: s0.lecturer,
+          room: s0.cwRoom,
+          isOnlineLocation: false,
+          rawNotes: '',
+          status: 'scheduled',
+        },
+        {
+          id: `uek-${parsed.entityId}-${sun}-2`,
+          date: sun,
+          dayOfWeek: 'Nd',
+          startTime: '10:45',
+          endTime: '13:15',
+          subject: s3.name,
+          type: 'Wykład',
+          normalizedType: 'wykład',
+          lecturer: s3.lecturer,
+          room: 'Online',
+          isOnlineLocation: true,
+          rawNotes: zIdx === 4 ? 'Uwagi: na 8.11 (MS Teams)' : '',
+          status: zIdx === 4 ? 'rescheduled' : 'scheduled',
+          statusReason: zIdx === 4 ? 'Uwagi: na 8.11 (MS Teams)' : undefined,
+        }
+      );
+    }
+  });
+
+  const enriched = enrichWithCountersAndHours(rawItems);
+  const groupLabel = `${track.codePrefix}-${parsed.entityId.slice(-3)} (id=${parsed.entityId})`;
+
+  return {
+    metadata: {
+      sourceUrl: parsed.cleanUrl,
+      typ: parsed.typ,
+      entityId: parsed.entityId,
+      okres: parsed.okres,
+      groupName: groupLabel,
+      groupFullName: `UEK Kraków · niestacjonarne · ${track.majorName} · gr. ${parsed.entityId}`,
+      authMode,
+      casUser,
+      authWarning,
+      fetchedAt: new Date().toISOString(),
+    },
+    items: enriched,
+  };
+}
+

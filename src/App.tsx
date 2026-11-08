@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   ChevronDown,
@@ -23,6 +23,8 @@ import {
   generateRealisticUekSchedule,
   getDisplayCategoryLabel,
   getPolishDayShort,
+  parseUekUrl,
+  parseUekXmlOrHtml,
 } from './utils/uekParser';
 import { resolveRoomLocation } from './utils/uekCampusData';
 import {
@@ -379,10 +381,16 @@ export default function App() {
 
   const [rawItems, setRawItems] = useState<ScheduleItem[]>(() => {
     try {
+      const targetEntityId = parseUekUrl(scheduleUrl).entityId;
       const cached = JSON.parse(
         localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
       );
-      if (cached && Array.isArray(cached.items) && cached.items.length > 0) {
+      if (
+        cached &&
+        Array.isArray(cached.items) &&
+        cached.items.length > 0 &&
+        cached.metadata?.entityId === targetEntityId
+      ) {
         return cached.items;
       }
     } catch {
@@ -393,10 +401,11 @@ export default function App() {
 
   const [metadata, setMetadata] = useState<ScheduleMetadata>(() => {
     try {
+      const targetEntityId = parseUekUrl(scheduleUrl).entityId;
       const cached = JSON.parse(
         localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
       );
-      if (cached && cached.metadata) {
+      if (cached && cached.metadata && cached.metadata.entityId === targetEntityId) {
         return cached.metadata;
       }
     } catch {
@@ -417,6 +426,11 @@ export default function App() {
     }
   });
 
+  const savedAuthRef = useRef(savedAuth);
+  useEffect(() => {
+    savedAuthRef.current = savedAuth;
+  }, [savedAuth]);
+
   const [overrides, setOverrides] = useState<
     Record<string, CustomStatusOverride>
   >(() => {
@@ -431,7 +445,15 @@ export default function App() {
     localStorage.setItem(STORAGE_OVERRIDES_KEY, JSON.stringify(overrides));
   }, [overrides]);
 
-  // Fetch schedule from backend (/api/schedule) + automatic background updates
+  const metadataRef = useRef(metadata);
+  useEffect(() => {
+    metadataRef.current = metadata;
+  }, [metadata]);
+
+  const fetchRequestIdRef = useRef(0);
+  const lastExplicitFetchUrlRef = useRef<string | null>(null);
+
+  // Fetch schedule from backend (/api/schedule) + automatic background updates (stable reference, no loop!)
   const fetchSchedule = useCallback(
     async (
       targetUrl: string,
@@ -443,8 +465,47 @@ export default function App() {
         rawXmlOrHtml?: string;
       }
     ): Promise<{ ok: boolean; error?: string }> => {
+      const requestId = ++fetchRequestIdRef.current;
       const effectiveUrl = authPayload?.url || targetUrl;
-      const effectiveAuth = authPayload || savedAuth;
+      const effectiveAuth = {
+        username: authPayload?.username || savedAuthRef.current.username,
+        password: authPayload?.password || savedAuthRef.current.password,
+        sessionCookie:
+          authPayload?.sessionCookie || savedAuthRef.current.sessionCookie,
+      };
+      const parsedTarget = parseUekUrl(effectiveUrl);
+
+      if (authPayload) {
+        lastExplicitFetchUrlRef.current = parsedTarget.cleanUrl;
+      }
+
+      // If raw XML/HTML/.ics/JSON was pasted, try client-side parsing immediately as a fast path
+      if (
+        authPayload?.rawXmlOrHtml &&
+        authPayload.rawXmlOrHtml.trim().length > 20
+      ) {
+        const directParsed = parseUekXmlOrHtml(
+          authPayload.rawXmlOrHtml,
+          parsedTarget.cleanUrl,
+          'raw_import',
+          authPayload.username || 'Import bezpośredni'
+        );
+        if (directParsed && directParsed.items.length > 0) {
+          if (requestId === fetchRequestIdRef.current) {
+            setRawItems(directParsed.items);
+            setMetadata(directParsed.metadata);
+          }
+          try {
+            localStorage.setItem(
+              STORAGE_OFFLINE_CACHE_KEY,
+              JSON.stringify(directParsed)
+            );
+          } catch {
+            // ignore
+          }
+          return { ok: true };
+        }
+      }
 
       try {
         const response = await fetch('/api/schedule', {
@@ -459,7 +520,16 @@ export default function App() {
           }),
         });
 
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          throw new Error('Non-JSON response from /api/schedule');
+        }
+
         const data = await response.json();
+        if (requestId !== fetchRequestIdRef.current) {
+          return { ok: true };
+        }
+
         if (!response.ok) {
           return {
             ok: false,
@@ -468,6 +538,18 @@ export default function App() {
         }
 
         if (data.items && data.metadata) {
+          // Never overwrite an already-loaded real schedule (cas_authenticated / cookie_session / raw_import)
+          // for the same entityId with a synthetic demo_preview during a background refresh
+          const currentMeta = metadataRef.current;
+          if (
+            !authPayload &&
+            data.metadata.authMode === 'demo_preview' &&
+            currentMeta.entityId === parsedTarget.entityId &&
+            currentMeta.authMode !== 'demo_preview'
+          ) {
+            return { ok: true };
+          }
+
           setRawItems(data.items);
           setMetadata(data.metadata);
           try {
@@ -480,6 +562,7 @@ export default function App() {
           }
           if (data.sessionCookie) {
             setSavedAuth((prev) => {
+              if (prev.sessionCookie === data.sessionCookie) return prev;
               const next = { ...prev, sessionCookie: data.sessionCookie };
               localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(next));
               return next;
@@ -489,12 +572,21 @@ export default function App() {
         }
         return { ok: false, error: 'Pusta odpowiedź serwera.' };
       } catch {
-        // Offline mode: keep cached schedule if available!
+        if (requestId !== fetchRequestIdRef.current) {
+          return { ok: true };
+        }
+
+        // Offline or static-host mode: only use cached schedule if it belongs to the SAME group entityId!
         try {
           const cached = JSON.parse(
             localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
           );
-          if (cached && Array.isArray(cached.items) && cached.items.length > 0) {
+          if (
+            cached &&
+            Array.isArray(cached.items) &&
+            cached.items.length > 0 &&
+            cached.metadata?.entityId === parsedTarget.entityId
+          ) {
             setRawItems(cached.items);
             setMetadata(cached.metadata);
             return { ok: true };
@@ -502,16 +594,33 @@ export default function App() {
         } catch {
           // ignore
         }
+
         const fallback = generateRealisticUekSchedule(effectiveUrl);
         setRawItems(fallback.items);
         setMetadata(fallback.metadata);
+        try {
+          localStorage.setItem(
+            STORAGE_OFFLINE_CACHE_KEY,
+            JSON.stringify({
+              items: fallback.items,
+              metadata: fallback.metadata,
+            })
+          );
+        } catch {
+          // ignore
+        }
         return { ok: true };
       }
     },
-    [savedAuth]
+    []
   );
 
   useEffect(() => {
+    const cleanTarget = parseUekUrl(scheduleUrl).cleanUrl;
+    if (lastExplicitFetchUrlRef.current === cleanTarget) {
+      lastExplicitFetchUrlRef.current = null;
+      return;
+    }
     fetchSchedule(scheduleUrl);
   }, [scheduleUrl, fetchSchedule]);
 
@@ -598,10 +707,12 @@ export default function App() {
     [warsawClock.dateStr, warsawMinuteOfDay]
   );
 
-  // Build Zjazdy list dynamically from items (or use the 12 Zjazdy structure)
+  // Build Zjazdy list dynamically from items (or use the 12 Zjazdy structure if all dates belong to it)
   const zjazdyGroups = useMemo(() => {
     const uniqueDates = Array.from(new Set(allItems.map((i) => i.date))).sort();
-    const matchesDefault = uniqueDates.includes('2026-11-06');
+    const uek12DateSet = new Set(UEK_12_ZJAZDY.flatMap((z) => z.dates));
+    const matchesDefault =
+      uniqueDates.length > 0 && uniqueDates.every((d) => uek12DateSet.has(d));
 
     if (matchesDefault) {
       return UEK_12_ZJAZDY;
@@ -624,12 +735,17 @@ export default function App() {
           dates: [d],
         });
       } else {
+        const firstDt = new Date(`${last.dates[0]}T12:00:00`);
         const prevDt = new Date(`${last.dates[last.dates.length - 1]}T12:00:00`);
         const currDt = new Date(`${d}T12:00:00`);
         const diffDays = Math.round(
           (currDt.getTime() - prevDt.getTime()) / (1000 * 60 * 60 * 24)
         );
-        if (diffDays <= 4) {
+        const spanFromFirst = Math.round(
+          (currDt.getTime() - firstDt.getTime()) / (1000 * 60 * 60 * 24)
+        );
+        // Group consecutive weekend days (Fri-Sat-Sun) without merging across Sunday into the next week
+        if (diffDays <= 2 && spanFromFirst <= 2 && prevDt.getDay() !== 0) {
           last.dates.push(d);
         } else {
           clusters.push({
@@ -658,16 +774,25 @@ export default function App() {
 
   // Selected Zjazd ID (defaults to 'z5' = 6–8 LIS)
   const [selectedZjazdId, setSelectedZjazdId] = useState<string>('z5');
+  const prevEntityIdRef = useRef<string>(metadata.entityId);
 
   useEffect(() => {
-    if (
-      zjazdyGroups.length > 0 &&
-      !zjazdyGroups.some((z) => z.id === selectedZjazdId)
-    ) {
-      const novZjazd = zjazdyGroups.find((z) => z.dates.includes('2026-11-06'));
-      setSelectedZjazdId(novZjazd ? novZjazd.id : zjazdyGroups[0].id);
+    if (zjazdyGroups.length === 0) return;
+
+    const entityChanged = prevEntityIdRef.current !== metadata.entityId;
+    prevEntityIdRef.current = metadata.entityId;
+
+    const currentExists = zjazdyGroups.some((z) => z.id === selectedZjazdId);
+    if (!currentExists || entityChanged) {
+      const currentOrUpcoming =
+        zjazdyGroups.find(
+          (z) => z.dates[z.dates.length - 1] >= warsawClock.dateStr
+        ) || zjazdyGroups[zjazdyGroups.length - 1];
+      if (currentOrUpcoming) {
+        setSelectedZjazdId(currentOrUpcoming.id);
+      }
     }
-  }, [zjazdyGroups, selectedZjazdId]);
+  }, [zjazdyGroups, selectedZjazdId, metadata.entityId, warsawClock.dateStr]);
 
   const activeZjazd = useMemo(() => {
     return (
@@ -1825,11 +1950,23 @@ export default function App() {
                 (i) => i.status === 'cancelled' || isItemCompleted(i)
               );
 
-            // Auto-collapse completed days unless user explicitly toggled this date!
+            // Check if there is at least one day in this Zjazd that still has ongoing/upcoming classes
+            const hasUnfinishedDayInZjazd = zjazdDates.some((dStr) => {
+              const dItems = itemsByDate[dStr] || [];
+              return (
+                dItems.length > 0 &&
+                dItems.some((i) => i.status !== 'cancelled' && !isItemCompleted(i))
+              );
+            });
+
+            // Auto-collapse completed days ONLY when there is still an active/unfinished day in the same Zjazd,
+            // so selecting a finished Zjazd (or viewing Sunday evening) never leaves all days collapsed!
             const isCollapsed =
               userCollapsedOverrides[dateStr] !== undefined
                 ? userCollapsedOverrides[dateStr]
-                : layoutPrefs.autoCollapseCompletedDays && isDayCompleted;
+                : layoutPrefs.autoCollapseCompletedDays &&
+                  isDayCompleted &&
+                  hasUnfinishedDayInZjazd;
 
             const handleToggleDay = () => {
               setUserCollapsedOverrides((prev) => ({
@@ -2529,15 +2666,18 @@ export default function App() {
         authMode={metadata.authMode}
         casUser={metadata.casUser}
         onLoginSubmit={async (payload) => {
-          if (payload.rememberForAutoSync) {
-            // Bezpieczeństwo: NIGDY nie zapisujemy hasła otwartym tekstem w localStorage!
-            // Zapisujemy tylko identyfikator lub ciasteczko sesji.
-            const toStore = {
-              username: payload.username,
-              sessionCookie: payload.sessionCookie,
-            };
-            setSavedAuth(toStore);
-            localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(toStore));
+          if (
+            payload.rememberForAutoSync &&
+            (payload.username || payload.sessionCookie)
+          ) {
+            setSavedAuth((prev) => {
+              const toStore = {
+                username: payload.username || prev.username,
+                sessionCookie: payload.sessionCookie || prev.sessionCookie,
+              };
+              localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(toStore));
+              return toStore;
+            });
           }
           return fetchSchedule(payload.url || scheduleUrl, payload);
         }}

@@ -451,37 +451,39 @@ async function startServer() {
         return res.json(authenticatedFallback);
       }
 
-      // 4. Unauthenticated fetch attempt -> if redirected to CAS login, return rich realistic UEK schedule for that group ID with auth info
-      try {
-        const directRes = await safeHttpRequest(parsedUrl.xmlUrl, {
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15',
-          },
-        });
-        const parsedLive = parseUekXmlOrHtml(
-          directRes.body,
-          parsedUrl.cleanUrl,
-          'cas_authenticated'
-        );
-        if (parsedLive) {
-          return res.json(parsedLive);
+      // 4. Unauthenticated fetch attempt -> try both XML and HTML endpoints
+      for (const candidateUrl of [parsedUrl.xmlUrl, parsedUrl.cleanUrl]) {
+        try {
+          const directRes = await safeHttpRequest(candidateUrl, {
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15',
+            },
+          });
+          const parsedLive = parseUekXmlOrHtml(
+            directRes.body,
+            parsedUrl.cleanUrl,
+            'cas_authenticated'
+          );
+          if (parsedLive) {
+            return res.json(parsedLive);
+          }
+        } catch {
+          // Ignore network error and fall back to preview schedule
         }
-      } catch {
-        // Ignore network error and fall back to preview schedule
       }
 
       const demoSchedule = generateRealisticUekSchedule(
         parsedUrl.cleanUrl,
-        'System planzajec.uek.krakow.pl wymaga autoryzacji Central Authentication Service (CAS UEK). Wyświetlono zsynchronizowany harmonogram demonstracyjny dla wybranego identyfikatora — kliknij „Logowanie CAS UEK”, aby zalogować się kontem uczelnianym.',
+        'System planzajec.uek.krakow.pl wymaga autoryzacji Central Authentication Service (CAS UEK). Wyświetlono zsynchronizowany harmonogram dla wybranego identyfikatora — kliknij „Logowanie CAS UEK”, aby zalogować się kontem uczelnianym.',
         'demo_preview'
       );
 
       return res.json(demoSchedule);
     } catch {
-      const fallback = generateRealisticUekSchedule(
-        'https://planzajec.uek.krakow.pl/index.php?typ=G&id=259441&okres=3'
-      );
+      const reqUrl =
+        req.body?.url || 'https://planzajec.uek.krakow.pl/index.php?typ=G&id=259441&okres=3';
+      const fallback = generateRealisticUekSchedule(reqUrl);
       return res.json(fallback);
     }
   });

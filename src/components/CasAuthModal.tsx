@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
@@ -82,6 +82,16 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
+  useEffect(() => {
+    if (isOpen) {
+      setLinkValue(currentUrl);
+      setLangLinkValue(languageUrl);
+      setRoomInput(customLangRoom);
+      setLecturerInput(customLangLecturer);
+      setStatusMessage(null);
+    }
+  }, [isOpen, currentUrl, languageUrl, customLangRoom, customLangLecturer]);
+
   if (!isOpen) return null;
 
   const trimmedLink = linkValue.trim();
@@ -144,7 +154,6 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
     const targetUrl = isEmpty ? DEFAULT_UEK_URL : parsed.cleanUrl;
     const targetLangUrl = isLangEmpty ? '' : parsedLang.cleanUrl;
 
-    onUpdateUrl(targetUrl);
     onUpdateLanguageConfig({
       languageUrl: targetLangUrl,
       customLangRoom: roomInput.trim(),
@@ -163,6 +172,8 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
         sessionCookie: proxyUrl.trim() || undefined,
         rememberForAutoSync: true,
       });
+
+      onUpdateUrl(targetUrl);
 
       if (res.ok) {
         setStatusMessage({
