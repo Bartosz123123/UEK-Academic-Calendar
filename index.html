@@ -66,6 +66,25 @@
               w.__deferredPwaPrompt = null;
               w.dispatchEvent(new CustomEvent('pwa-installed'));
             });
+            if ('caches' in w) {
+              caches.keys().then(function (keys) {
+                keys.forEach(function (k) {
+                  if (k !== 'plan-uek-pwa-v6') {
+                    caches.delete(k);
+                  }
+                });
+              }).catch(function () {});
+            }
+            if ('serviceWorker' in navigator) {
+              w.addEventListener('load', function () {
+                navigator.serviceWorker
+                  .register('/sw.js')
+                  .then(function (reg) {
+                    try { reg.update(); } catch (_) {}
+                  })
+                  .catch(function () {});
+              });
+            }
           }
         } catch (_) {}
       })();
@@ -91,84 +110,6 @@
   </head>
   <body class="bg-[#F5F5F7] text-[#1D1D1F] dark:bg-[#0B0C0E] dark:text-[#F5F5F7] antialiased selection:bg-[#0071E3]/15 selection:text-[#0071E3]">
     <div id="root"></div>
-    <script>
-      (function () {
-        var booted = false;
-        function bootApp() {
-          if (booted) return;
-          booted = true;
-          var s = document.createElement('script');
-          s.type = 'module';
-          s.src = '/src/main.tsx?v=6';
-          document.body.appendChild(s);
-          if ('serviceWorker' in navigator) {
-            window.addEventListener('load', function () {
-              navigator.serviceWorker
-                .register('/sw.js?v=6')
-                .then(function (reg) {
-                  try { reg.update(); } catch (_) {}
-                })
-                .catch(function () {});
-            });
-          }
-        }
-        try {
-          if ('caches' in window) {
-            var timer = setTimeout(bootApp, 120);
-            caches
-              .keys()
-              .then(function (keys) {
-                var stale = keys.filter(function (k) {
-                  return k !== 'plan-uek-pwa-v6';
-                });
-                if (stale.length === 0) {
-                  clearTimeout(timer);
-                  bootApp();
-                  return;
-                }
-                return Promise.all(
-                  stale.map(function (k) {
-                    return caches.delete(k);
-                  })
-                ).then(function () {
-                  clearTimeout(timer);
-                  if (
-                    'serviceWorker' in navigator &&
-                    navigator.serviceWorker.controller &&
-                    !sessionStorage.getItem('uek_sw_v6_reset')
-                  ) {
-                    sessionStorage.setItem('uek_sw_v6_reset', '1');
-                    navigator.serviceWorker
-                      .getRegistrations()
-                      .then(function (regs) {
-                        return Promise.all(
-                          regs.map(function (r) {
-                            return r.unregister();
-                          })
-                        );
-                      })
-                      .then(function () {
-                        window.location.reload();
-                      })
-                      .catch(function () {
-                        bootApp();
-                      });
-                  } else {
-                    bootApp();
-                  }
-                });
-              })
-              .catch(function () {
-                clearTimeout(timer);
-                bootApp();
-              });
-          } else {
-            bootApp();
-          }
-        } catch (_) {
-          bootApp();
-        }
-      })();
-    </script>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
