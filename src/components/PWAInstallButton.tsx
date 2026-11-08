@@ -166,17 +166,28 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({
 
                 {/* Warning if opened inside Messenger / Instagram WebView */}
                 {isInAppBrowser && (
-                  <div className="p-3.5 rounded-2xl bg-amber-500/15 border border-amber-500/35 text-amber-900 dark:text-amber-200 space-y-1.5">
+                  <div className="p-3.5 rounded-2xl bg-amber-500/15 border border-amber-500/35 text-amber-900 dark:text-amber-200 space-y-2.5">
                     <p className="font-bold flex items-center gap-1.5">
                       <ExternalLink className="w-4 h-4 shrink-0 text-amber-500" />
-                      <span>Otwierasz link w komunikatorze (np. Messenger)</span>
+                      <span>Otwierasz link w komunikatorze (Messenger)</span>
                     </p>
                     <p>
-                      Wbudowana przeglądarka Messengera/Instagrama blokuje
-                      dodawanie ikon na pulpit. Kliknij{' '}
-                      <strong>⋮ w prawym górnym rogu</strong> i wybierz{' '}
-                      <strong>„Otwórz w przeglądarce Chrome / Safari”</strong>.
+                      Wbudowana przeglądarka Messengera blokuje dodawanie ikon na
+                      pulpit. Kliknij przycisk poniżej lub w menu{' '}
+                      <strong>⋯ w prawym górnym rogu</strong> wybierz{' '}
+                      <strong>„↗ Otwórz w przeglądarce”</strong>:
                     </p>
+                    {!isIOS && typeof window !== 'undefined' && (
+                      <a
+                        href={`intent://${window.location.host}${window.location.pathname}${window.location.search}#Intent;scheme=https;package=com.android.chrome;S.browser_fallback_url=${encodeURIComponent(
+                          window.location.href
+                        )};end`}
+                        className="w-full py-2.5 px-3.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs flex items-center justify-center gap-2 shadow-md transition-colors"
+                      >
+                        <ExternalLink className="w-4 h-4 shrink-0" />
+                        <span>Przejdź od razu do Chrome (1 kliknięciem)</span>
+                      </a>
+                    )}
                   </div>
                 )}
 
