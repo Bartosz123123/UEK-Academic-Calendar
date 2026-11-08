@@ -57,6 +57,20 @@
               },
               true
             );
+            w.addEventListener('beforeinstallprompt', function (e) {
+              e.preventDefault();
+              w.__deferredPwaPrompt = e;
+              w.dispatchEvent(new CustomEvent('pwa-prompt-ready'));
+            });
+            w.addEventListener('appinstalled', function () {
+              w.__deferredPwaPrompt = null;
+              w.dispatchEvent(new CustomEvent('pwa-installed'));
+            });
+            if ('serviceWorker' in navigator) {
+              w.addEventListener('load', function () {
+                navigator.serviceWorker.register('/sw.js').catch(function () {});
+              });
+            }
           }
         } catch (_) {}
       })();
