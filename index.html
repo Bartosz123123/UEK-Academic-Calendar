@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        try {
+          if (typeof window !== 'undefined') {
+            var w = window;
+            if (!w.chrome) w.chrome = {};
+            if (!w.chrome.runtime) {
+              w.chrome.runtime = {
+                onMessage: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
+                onConnect: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
+                sendMessage: function () {}
+              };
+            } else if (!w.chrome.runtime.onMessage) {
+              w.chrome.runtime.onMessage = {
+                addListener: function () {},
+                removeListener: function () {},
+                hasListener: function () { return false; }
+              };
+            }
+            var shouldIgnoreError = function (msg, source, stack) {
+              var m = String(msg || '');
+              var s = String(source || '');
+              var st = String(stack || '');
+              return (
+                s.indexOf('chrome-extension://') !== -1 ||
+                s.indexOf('moz-extension://') !== -1 ||
+                st.indexOf('chrome-extension://') !== -1 ||
+                m.indexOf("reading 'onMessage'") !== -1 ||
+                m.indexOf('WebSocket closed without opened') !== -1
+              );
+            };
+            w.addEventListener(
+              'error',
+              function (e) {
+                if (shouldIgnoreError(e.message, e.filename, e.error && e.error.stack)) {
+                  e.stopImmediatePropagation();
+                  e.stopPropagation();
+                  e.preventDefault();
+                  return true;
+                }
+              },
+              true
+            );
+            w.addEventListener(
+              'unhandledrejection',
+              function (e) {
+                var r = e.reason;
+                if (shouldIgnoreError(r && r.message ? r.message : r, '', r && r.stack)) {
+                  e.stopImmediatePropagation();
+                  e.stopPropagation();
+                  e.preventDefault();
+                }
+              },
+              true
+            );
+          }
+        } catch (_) {}
+      })();
+    </script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Plan UEK — Harmonogram Zajęć</title>
+    <meta name="description" content="Minimalistyczny plan zajęć Uniwersytetu Ekonomicznego w Krakowie w estetyce Apple z obsługą linków UEK, oznaczeniami odwołanych i przeniesionych zajęć oraz eksportem do kalendarza." />
+    <meta property="og:title" content="Plan UEK — Harmonogram Zajęć" />
+    <meta property="og:description" content="Minimalistyczny plan zajęć Uniwersytetu Ekonomicznego w Krakowie w estetyce Apple z obsługą linków UEK, oznaczeniami odwołanych i przeniesionych zajęć oraz eksportem do kalendarza." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#12161F" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Plan UEK" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-[#F5F5F7] text-[#1D1D1F] dark:bg-[#0B0C0E] dark:text-[#F5F5F7] antialiased selection:bg-[#0071E3]/15 selection:text-[#0071E3]">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

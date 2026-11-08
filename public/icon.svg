@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="appleBg" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1D74F5" />
+      <stop offset="55%" stop-color="#0F4BC2" />
+      <stop offset="100%" stop-color="#081E52" />
+    </linearGradient>
+    <linearGradient id="glassCard" x1="96" y1="96" x2="416" y2="416" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.96" />
+      <stop offset="100%" stop-color="#E2ECFF" stop-opacity="0.88" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#appleBg)" />
+  <circle cx="400" cy="112" r="140" fill="#5AC8FA" fill-opacity="0.22" />
+  <rect x="96" y="104" width="320" height="304" rx="56" fill="url(#glassCard)" />
+  <path d="M96 160C96 129.072 121.072 104 152 104H360C390.928 104 416 129.072 416 160V188H96V160Z" fill="#007AFF" />
+  <circle cx="176" cy="146" r="12" fill="#FFFFFF" />
+  <circle cx="336" cy="146" r="12" fill="#FFFFFF" />
+  <rect x="144" y="232" width="140" height="26" rx="13" fill="#0F4BC2" />
+  <rect x="144" y="282" width="224" height="22" rx="11" fill="#64748B" fill-opacity="0.45" />
+  <rect x="144" y="328" width="172" height="22" rx="11" fill="#2ECC71" />
+  <circle cx="354" cy="339" r="24" fill="#2ECC71" />
+  <path d="M344 339L351 346L365 332" stroke="#FFFFFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" />
+</svg>

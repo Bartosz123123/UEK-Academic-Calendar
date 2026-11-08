@@ -1,0 +1,6 @@
+{
+  "name": "Plan UEK — Harmonogram Zajęć",
+  "description": "Minimalistyczny plan zajęć Uniwersytetu Ekonomicznego w Krakowie w estetyce Apple z obsługą linków UEK, oznaczeniami odwołanych i przeniesionych zajęć oraz eksportem do kalendarza.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

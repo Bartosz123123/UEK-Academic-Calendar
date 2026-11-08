@@ -1,0 +1,31 @@
+{
+  "id": "/",
+  "name": "Plan UEK — Harmonogram Zajęć",
+  "short_name": "Plan UEK",
+  "description": "Minimalistyczny plan zajęć Uniwersytetu Ekonomicznego w Krakowie w estetyce Apple z obsługą linków UEK i trybem offline.",
+  "theme_color": "#12161F",
+  "background_color": "#0B0C0E",
+  "display": "standalone",
+  "start_url": "/",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
