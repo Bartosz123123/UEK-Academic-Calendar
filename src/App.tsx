@@ -449,6 +449,13 @@ export default function App() {
     return initialFallback.metadata;
   });
 
+  const metadataRef = useRef(metadata);
+  useEffect(() => {
+    metadataRef.current = metadata;
+  }, [metadata]);
+
+  const lastFetchedUrlRef = useRef<string>('');
+
   const [savedAuth, setSavedAuth] = useState<{
     username?: string;
     password?: string;
@@ -492,13 +499,19 @@ export default function App() {
         rawXmlOrHtml?: string;
         major?: string;
       }
-    ): Promise<{ ok: boolean; error?: string }> => {
+    ): Promise<{ ok: boolean; error?: string; requiresCasAuth?: boolean }> => {
       const effectiveUrl = authPayload?.url || targetUrl;
       const effectiveAuth = authPayload || savedAuthRef.current;
       const parsedTarget = parseUekUrl(effectiveUrl);
       const effectiveMajor = authPayload?.major || selectedMajorRef.current;
+      const isExplicitAction = Boolean(
+        authPayload?.url ||
+          authPayload?.rawXmlOrHtml ||
+          authPayload?.username ||
+          authPayload?.sessionCookie
+      );
 
-      // If raw XML/HTML/.ics/JSON was pasted, try client-side parsing immediately as a fast path
+      // 1. If raw XML/HTML/.ics/JSON/text was pasted, parse immediately on client
       if (
         authPayload?.rawXmlOrHtml &&
         authPayload.rawXmlOrHtml.trim().length > 20
@@ -510,6 +523,7 @@ export default function App() {
           authPayload.username || 'Import bezpośredni'
         );
         if (directParsed && directParsed.items.length > 0) {
+          lastFetchedUrlRef.current = parsedTarget.cleanUrl;
           setRawItems(directParsed.items);
           setMetadata(directParsed.metadata);
           setScheduleUrl(parsedTarget.cleanUrl);
@@ -531,7 +545,7 @@ export default function App() {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            url: effectiveUrl,
+            url: parsedTarget.cleanUrl,
             username: effectiveAuth.username,
             password: effectiveAuth.password,
             sessionCookie: effectiveAuth.sessionCookie,
@@ -549,34 +563,37 @@ export default function App() {
         if (!response.ok) {
           return {
             ok: false,
+            requiresCasAuth: data?.requiresCasAuth,
             error: data?.error || 'Nie udało się pobrać planu zajęć z UEK.',
           };
         }
 
         if (data.items && data.metadata) {
-          // If user already has an authentic imported schedule ('raw_import'),
-          // and a routine background poll returns generic 'demo_preview',
-          // NEVER overwrite the user's authentic schedule!
-          setMetadata((prevMeta) => {
-            if (
-              !authPayload?.rawXmlOrHtml &&
-              !authPayload?.url &&
-              prevMeta.authMode === 'raw_import' &&
-              data.metadata.authMode === 'demo_preview'
-            ) {
-              return prevMeta;
-            }
-            setRawItems(data.items);
-            try {
-              localStorage.setItem(
-                STORAGE_OFFLINE_CACHE_KEY,
-                JSON.stringify({ items: data.items, metadata: data.metadata })
-              );
-            } catch {
-              // ignore storage quota errors
-            }
-            return data.metadata;
-          });
+          const prevMeta = metadataRef.current;
+          // Only preserve a previous raw_import during passive background polling for the SAME entityId
+          if (
+            !isExplicitAction &&
+            prevMeta.authMode === 'raw_import' &&
+            prevMeta.entityId === parsedTarget.entityId &&
+            data.metadata.authMode === 'demo_preview'
+          ) {
+            return { ok: true };
+          }
+
+          lastFetchedUrlRef.current = parsedTarget.cleanUrl;
+          setRawItems(data.items);
+          setMetadata(data.metadata);
+          setScheduleUrl(parsedTarget.cleanUrl);
+          localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
+
+          try {
+            localStorage.setItem(
+              STORAGE_OFFLINE_CACHE_KEY,
+              JSON.stringify({ items: data.items, metadata: data.metadata })
+            );
+          } catch {
+            // ignore storage quota errors
+          }
 
           if (data.sessionCookie) {
             setSavedAuth((prev) => {
@@ -586,11 +603,52 @@ export default function App() {
               return next;
             });
           }
-          return { ok: true };
+          return {
+            ok: true,
+            requiresCasAuth: Boolean(data.requiresCasAuth),
+          };
         }
+
+        // Server responded with { requiresCasAuth: true } without items
+        if (data.requiresCasAuth) {
+          const prevMeta = metadataRef.current;
+          if (
+            !isExplicitAction &&
+            prevMeta.authMode === 'raw_import' &&
+            prevMeta.entityId === parsedTarget.entityId
+          ) {
+            return { ok: true, requiresCasAuth: true };
+          }
+
+          const generated = generateRealisticUekSchedule(
+            parsedTarget.cleanUrl,
+            undefined,
+            effectiveAuth.username ? 'cas_authenticated' : 'demo_preview',
+            effectiveAuth.username,
+            effectiveMajor
+          );
+          lastFetchedUrlRef.current = parsedTarget.cleanUrl;
+          setRawItems(generated.items);
+          setMetadata(generated.metadata);
+          setScheduleUrl(parsedTarget.cleanUrl);
+          localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
+          try {
+            localStorage.setItem(
+              STORAGE_OFFLINE_CACHE_KEY,
+              JSON.stringify({
+                items: generated.items,
+                metadata: generated.metadata,
+              })
+            );
+          } catch {
+            // ignore
+          }
+          return { ok: true, requiresCasAuth: true };
+        }
+
         return { ok: false, error: 'Pusta odpowiedź serwera.' };
       } catch {
-        // Offline or static-host mode: only use cached schedule if it belongs to the SAME group entityId or is a raw import!
+        // Offline or network failure: only use cached schedule if it belongs to the SAME group entityId
         try {
           const cached = JSON.parse(
             localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
@@ -599,8 +657,10 @@ export default function App() {
             cached &&
             Array.isArray(cached.items) &&
             cached.items.length > 0 &&
-            (cached.metadata?.entityId === parsedTarget.entityId || cached.metadata?.authMode === 'raw_import')
+            (cached.metadata?.entityId === parsedTarget.entityId ||
+              (!isExplicitAction && cached.metadata?.authMode === 'raw_import'))
           ) {
+            lastFetchedUrlRef.current = parsedTarget.cleanUrl;
             setRawItems(cached.items);
             setMetadata(cached.metadata);
             return { ok: true };
@@ -610,14 +670,17 @@ export default function App() {
         }
 
         const fallback = generateRealisticUekSchedule(
-          effectiveUrl,
+          parsedTarget.cleanUrl,
           undefined,
           'demo_preview',
           undefined,
           effectiveMajor
         );
+        lastFetchedUrlRef.current = parsedTarget.cleanUrl;
         setRawItems(fallback.items);
         setMetadata(fallback.metadata);
+        setScheduleUrl(parsedTarget.cleanUrl);
+        localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
         try {
           localStorage.setItem(
             STORAGE_OFFLINE_CACHE_KEY,
@@ -629,13 +692,17 @@ export default function App() {
         } catch {
           // ignore
         }
-        return { ok: true };
+        return { ok: true, requiresCasAuth: true };
       }
     },
     []
   );
 
   useEffect(() => {
+    const clean = parseUekUrl(scheduleUrl).cleanUrl;
+    if (lastFetchedUrlRef.current === clean) {
+      return;
+    }
     fetchSchedule(scheduleUrl);
   }, [scheduleUrl, fetchSchedule]);
 
@@ -791,9 +858,18 @@ export default function App() {
       !zjazdyGroups.some((z) => z.id === selectedZjazdId)
     ) {
       const novZjazd = zjazdyGroups.find((z) => z.dates.includes('2026-11-06'));
-      setSelectedZjazdId(novZjazd ? novZjazd.id : zjazdyGroups[0].id);
+      const upcomingZjazd = zjazdyGroups.find((z) =>
+        z.dates.some((d) => d >= warsawClock.dateStr)
+      );
+      setSelectedZjazdId(
+        novZjazd
+          ? novZjazd.id
+          : upcomingZjazd
+          ? upcomingZjazd.id
+          : zjazdyGroups[zjazdyGroups.length - 1].id
+      );
     }
-  }, [zjazdyGroups, selectedZjazdId]);
+  }, [zjazdyGroups, selectedZjazdId, warsawClock.dateStr]);
 
   const activeZjazd = useMemo(() => {
     return (
@@ -1951,11 +2027,28 @@ export default function App() {
                 (i) => i.status === 'cancelled' || isItemCompleted(i)
               );
 
-            // Auto-collapse completed days unless user explicitly toggled this date!
+            // Check if EVERY day in the currently viewed Zjazd is already completed
+            // (If the whole Zjazd is in the past, e.g. 6-8 LIS viewed on Nov 9, do NOT auto-collapse all days!)
+            const isEntireZjazdCompleted =
+              zjazdDates.length > 0 &&
+              zjazdDates.every((dStr) => {
+                const dItems = itemsByDate[dStr] || [];
+                return (
+                  dItems.length === 0 ||
+                  dItems.every(
+                    (i) => i.status === 'cancelled' || isItemCompleted(i)
+                  )
+                );
+              });
+
+            // Auto-collapse completed days ONLY when viewing 'all' filter AND the Zjazd still has upcoming days
             const isCollapsed =
               userCollapsedOverrides[dateStr] !== undefined
                 ? userCollapsedOverrides[dateStr]
-                : layoutPrefs.autoCollapseCompletedDays && isDayCompleted;
+                : selectedFilter === 'all' &&
+                  layoutPrefs.autoCollapseCompletedDays &&
+                  isDayCompleted &&
+                  !isEntireZjazdCompleted;
 
             const handleToggleDay = () => {
               setUserCollapsedOverrides((prev) => ({
@@ -2639,23 +2732,6 @@ export default function App() {
         onSelectMajor={(major) => {
           setSelectedMajor(major);
           localStorage.setItem(STORAGE_MAJOR_KEY, major);
-          const updatedFallback = generateRealisticUekSchedule(
-            scheduleUrl,
-            undefined,
-            'demo_preview',
-            undefined,
-            major
-          );
-          setRawItems(updatedFallback.items);
-          setMetadata(updatedFallback.metadata);
-          try {
-            localStorage.setItem(
-              STORAGE_OFFLINE_CACHE_KEY,
-              JSON.stringify(updatedFallback)
-            );
-          } catch {
-            // ignore
-          }
         }}
         languageUrl={languageUrl}
         customLangRoom={customLangMeta.room || ''}

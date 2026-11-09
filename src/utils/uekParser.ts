@@ -124,11 +124,77 @@ export function getDisplayCategoryLabel(norm: NormalizedClassType): string {
   }
 }
 
+export function extractCleanTypeAndNotes(
+  rawType: string,
+  rawNotes: string,
+  rawSubject = '',
+  rawRoom = ''
+): { cleanType: string; cleanSubject: string; combinedNotes: string } {
+  let cleanType = (rawType || 'Wykład').trim();
+  let cleanSubject = (rawSubject || 'Zajęcia UEK').trim();
+  const noteParts: string[] = [];
+
+  if (rawNotes && rawNotes.trim()) {
+    noteParts.push(rawNotes.trim());
+  }
+
+  // Check if rawType has embedded "Uwagi: ..." or newline-separated note (from <br> in UEK HTML table)
+  const typeUwagiMatch = cleanType.match(/^(.*?)\b(uwagi\s*:?\s*[\s\S]+)$/i);
+  if (typeUwagiMatch) {
+    cleanType = typeUwagiMatch[1].trim() || 'Wykład';
+    noteParts.push(typeUwagiMatch[2].trim());
+  } else if (cleanType.includes('\n')) {
+    const lines = cleanType
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length >= 2) {
+      cleanType = lines[0];
+      noteParts.push(lines.slice(1).join(' · '));
+    }
+  } else {
+    const inlineDateShift = cleanType.match(
+      /^(wykład|ćwiczenia|lektorat|seminarium|laboratorium|konwersatorium|projekt)\s+((?:przeniesion|odwołan|z\s+\d|na\s+\d|odrabian|kolokwium|egzamin|zaliczenie)[\s\S]+)$/i
+    );
+    if (inlineDateShift) {
+      cleanType = inlineDateShift[1].trim();
+      noteParts.push(inlineDateShift[2].trim());
+    }
+  }
+
+  // Check if rawSubject has embedded "Uwagi: ..."
+  const subjUwagiMatch = cleanSubject.match(/^(.*?)\s*\b(uwagi\s*:?\s*[\s\S]+)$/i);
+  if (subjUwagiMatch && subjUwagiMatch[1].trim().length > 2) {
+    cleanSubject = subjUwagiMatch[1].trim();
+    noteParts.push(subjUwagiMatch[2].trim());
+  }
+
+  // Check if rawRoom has embedded "Uwagi: ..."
+  const roomUwagiMatch = (rawRoom || '').match(/\b(uwagi\s*:?\s*[\s\S]+)$/i);
+  if (roomUwagiMatch) {
+    noteParts.push(roomUwagiMatch[1].trim());
+  }
+
+  const uniqueNotes = Array.from(
+    new Set(
+      noteParts
+        .map((n) => n.replace(/^uwagi\s*:?\s*/i, '').trim())
+        .filter(Boolean)
+    )
+  );
+
+  const combinedNotes =
+    uniqueNotes.length > 0 ? `Uwagi: ${uniqueNotes.join(' · ')}` : '';
+
+  return { cleanType, cleanSubject, combinedNotes };
+}
+
 export function detectStatusFromFields(
   typeStr: string,
   roomStr: string,
   notesStr: string,
-  rowClassStr = ''
+  rowClassStr = '',
+  subjectStr = ''
 ): {
   status: ClassStatus;
   statusReason?: string;
@@ -137,7 +203,15 @@ export function detectStatusFromFields(
   rescheduledToRoom?: string;
   previousRoom?: string;
 } {
-  const combined = `${typeStr} ${notesStr} ${rowClassStr}`.toLowerCase();
+  const { combinedNotes } = extractCleanTypeAndNotes(
+    typeStr,
+    notesStr,
+    subjectStr,
+    roomStr
+  );
+  const effectiveNotes = combinedNotes || notesStr.trim();
+  const combined =
+    `${subjectStr} ${typeStr} ${roomStr} ${effectiveNotes} ${rowClassStr}`.toLowerCase();
 
   if (
     combined.includes('odwołane') ||
@@ -149,20 +223,24 @@ export function detectStatusFromFields(
   ) {
     return {
       status: 'cancelled',
-      statusReason: notesStr.trim() || 'Zajęcia odwołane',
+      statusReason: effectiveNotes || 'Zajęcia odwołane',
     };
   }
 
   if (
+    effectiveNotes.length > 0 ||
+    combined.includes('uwagi') ||
     combined.includes('przeniesion') ||
     combined.includes('przeniesienie') ||
     combined.includes('przełożon') ||
-    combined.includes('uwagi: na') ||
+    combined.includes('przelozon') ||
     combined.includes('na dzień') ||
+    combined.includes('z dnia') ||
     combined.includes('odrabianie') ||
-    notesStr.trim().length > 0
+    combined.includes('zmiana terminu') ||
+    /\b(z|na)\s+\d{1,2}\.\d{1,2}\b/i.test(combined)
   ) {
-    const cleanNote = notesStr.trim();
+    const cleanNote = effectiveNotes || notesStr.trim() || typeStr.trim();
     const formattedReason = cleanNote.toLowerCase().startsWith('uwagi')
       ? cleanNote
       : `Uwagi: ${cleanNote}`;
@@ -175,7 +253,7 @@ export function detectStatusFromFields(
   if (combined.includes('zmiana sali')) {
     return {
       status: 'room_changed',
-      statusReason: notesStr.trim() || 'Zmiana sali',
+      statusReason: effectiveNotes || 'Zmiana sali',
     };
   }
 
@@ -195,10 +273,17 @@ function decodeHtmlEntities(text: string): string {
     .trim();
 }
 
-function extractXmlTag(block: string, tag: string): string {
+function extractXmlTag(block: string, tag: string, preserveLinks = false): string {
   const regex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i');
   const match = block.match(regex);
-  return match ? decodeHtmlEntities(match[1].replace(/<[^>]+>/g, '')) : '';
+  if (!match) return '';
+  const inner = match[1];
+  if (preserveLinks && /<a\s+[^>]*href=/i.test(inner)) {
+    return decodeHtmlEntities(inner);
+  }
+  return decodeHtmlEntities(
+    inner.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '')
+  );
 }
 
 export function cleanRoomAndLink(rawRoom: string): {
@@ -206,7 +291,9 @@ export function cleanRoomAndLink(rawRoom: string): {
   onlineUrl?: string;
   isOnline: boolean;
 } {
-  const trimmed = (rawRoom || '').trim();
+  const trimmed = (rawRoom || '')
+    .replace(/\b(uwagi\s*:?\s*[\s\S]+)$/i, '')
+    .trim();
   if (!trimmed) {
     return { cleanRoom: 'Online', isOnline: true };
   }
@@ -279,6 +366,45 @@ function enrichWithCountersAndHours(items: ScheduleItem[]): ScheduleItem[] {
   });
 }
 
+export function mergeScheduleNotes(
+  primary: ScheduleResponse,
+  secondary: ScheduleResponse | null
+): ScheduleResponse {
+  if (!secondary || !secondary.items || secondary.items.length === 0) {
+    return primary;
+  }
+  const secMap = new Map<string, ScheduleItem>();
+  for (const sItem of secondary.items) {
+    const key = `${sItem.date}__${sItem.startTime}`;
+    if (sItem.rawNotes || sItem.status !== 'scheduled' || sItem.onlineUrl) {
+      secMap.set(key, sItem);
+    }
+  }
+  if (secMap.size === 0) return primary;
+
+  const mergedItems = primary.items.map((pItem) => {
+    const match = secMap.get(`${pItem.date}__${pItem.startTime}`);
+    if (!match) return pItem;
+    const rawNotes = pItem.rawNotes || match.rawNotes || '';
+    const status =
+      pItem.status !== 'scheduled' ? pItem.status : match.status;
+    const statusReason =
+      pItem.statusReason || match.statusReason || rawNotes || undefined;
+    return {
+      ...pItem,
+      rawNotes,
+      status,
+      statusReason,
+      onlineUrl: pItem.onlineUrl || match.onlineUrl,
+    };
+  });
+
+  return {
+    ...primary,
+    items: mergedItems,
+  };
+}
+
 export function parseUekXmlOrHtml(
   rawContent: string,
   sourceUrl: string,
@@ -306,12 +432,21 @@ export function parseUekXmlOrHtml(
           const date = row.date || row.termin || '2026-11-06';
           const startTime = (row.startTime || row.od || '08:00').slice(0, 5);
           const endTime = (row.endTime || row.do || '10:30').slice(0, 5);
-          const subject = row.subject || row.przedmiot || 'Zajęcia UEK';
-          const type = row.type || row.forma || 'Wykład';
+          const rawSubject = row.subject || row.przedmiot || 'Zajęcia UEK';
+          const rawType = row.type || row.forma || 'Wykład';
           const lecturer = row.lecturer || row.nauczyciel || '';
           const room = row.room || row.sala || 'Online';
-          const rawNotes = row.rawNotes || row.uwagi || '';
-          const statusInfo = detectStatusFromFields(type, room, rawNotes);
+          const rawNotesInput = row.rawNotes || row.uwagi || '';
+
+          const { cleanType, cleanSubject, combinedNotes } =
+            extractCleanTypeAndNotes(rawType, rawNotesInput, rawSubject, room);
+          const statusInfo = detectStatusFromFields(
+            cleanType,
+            room,
+            combinedNotes,
+            '',
+            cleanSubject
+          );
 
           return {
             id: `uek-json-${date}-${startTime}-${idx}`,
@@ -319,12 +454,12 @@ export function parseUekXmlOrHtml(
             dayOfWeek: getPolishDayShort(date),
             startTime,
             endTime,
-            subject,
-            type,
-            normalizedType: normalizeClassType(type),
+            subject: cleanSubject,
+            type: cleanType,
+            normalizedType: normalizeClassType(cleanType),
             lecturer,
             room,
-            rawNotes,
+            rawNotes: combinedNotes,
             ...statusInfo,
           };
         });
@@ -372,20 +507,28 @@ export function parseUekXmlOrHtml(
       const room = locMatch ? locMatch[1].trim() : 'Online';
       const rawDesc = descMatch ? descMatch[1].replace(/\\n/g, ' ').trim() : '';
 
-      let type = 'Wykład';
-      let subject = rawSummary;
+      let rawType = 'Wykład';
+      let rawSubject = rawSummary;
       const parenType = rawSummary.match(/\(([^)]+)\)\s*$/);
       if (parenType) {
-        type = parenType[1];
-        subject = rawSummary.replace(/\s*\([^)]+\)\s*$/, '').trim();
+        rawType = parenType[1];
+        rawSubject = rawSummary.replace(/\s*\([^)]+\)\s*$/, '').trim();
       }
 
       const uwagaMatch = rawDesc.match(/Uwagi:\s*([^;]+)/i);
-      const rawNotes = uwagaMatch ? `Uwagi: ${uwagaMatch[1].trim()}` : '';
+      const rawNotesInput = uwagaMatch ? `Uwagi: ${uwagaMatch[1].trim()}` : '';
       const lectMatch = rawDesc.match(/(?:Prowadzący|Nauczyciel):\s*([^;\\]+)/i);
-      const lecturer = lectMatch ? lectMatch[1].trim() : 'Wykładowca UEK';
+      const lecturer = lectMatch ? lectMatch[1].trim() : '';
 
-      const statusInfo = detectStatusFromFields(type, room, rawNotes);
+      const { cleanType, cleanSubject, combinedNotes } =
+        extractCleanTypeAndNotes(rawType, rawNotesInput, rawSubject, room);
+      const statusInfo = detectStatusFromFields(
+        cleanType,
+        room,
+        combinedNotes,
+        '',
+        cleanSubject
+      );
 
       items.push({
         id: `uek-ics-${date}-${startTime}-${idx++}`,
@@ -393,12 +536,12 @@ export function parseUekXmlOrHtml(
         dayOfWeek: getPolishDayShort(date),
         startTime,
         endTime,
-        subject,
-        type,
-        normalizedType: normalizeClassType(type),
+        subject: cleanSubject,
+        type: cleanType,
+        normalizedType: normalizeClassType(cleanType),
         lecturer,
         room,
-        rawNotes,
+        rawNotes: combinedNotes,
         ...statusInfo,
       });
     }
@@ -444,17 +587,23 @@ export function parseUekXmlOrHtml(
       const dayOfWeek = extractXmlTag(block, 'dzien');
       const rawStart = extractXmlTag(block, 'od-godz');
       const rawEnd = extractXmlTag(block, 'do-godz');
-      const subject = extractXmlTag(block, 'przedmiot') || 'Zajęcia dydaktyczne';
-      const type = extractXmlTag(block, 'typ') || 'wykład';
+      const rawSubject = extractXmlTag(block, 'przedmiot') || 'Zajęcia dydaktyczne';
+      const rawType = extractXmlTag(block, 'typ') || 'wykład';
       const lecturer = extractXmlTag(block, 'nauczyciel') || '';
-      const rawRoom = extractXmlTag(block, 'sala') || 'Online';
-      const rawNotes = extractXmlTag(block, 'uwagi');
+      const rawRoom = extractXmlTag(block, 'sala', true) || 'Online';
+      const rawNotesInput =
+        extractXmlTag(block, 'uwagi') || extractXmlTag(block, 'uwaga');
+
+      const { cleanType, cleanSubject, combinedNotes } =
+        extractCleanTypeAndNotes(rawType, rawNotesInput, rawSubject, rawRoom);
 
       const room =
         rawRoom.toLowerCase().includes('zdalny') ||
         rawRoom.toLowerCase().includes('moodle') ||
         rawRoom.toLowerCase().includes('teams')
-          ? 'Online'
+          ? rawRoom.includes('href=')
+            ? rawRoom
+            : 'Online'
           : rawRoom;
 
       const moidMatch = block.match(/<nauczyciel[^>]*moid="([^"]+)"/i);
@@ -465,7 +614,13 @@ export function parseUekXmlOrHtml(
 
       if (!date || !startTime) continue;
 
-      const statusInfo = detectStatusFromFields(type, room, rawNotes);
+      const statusInfo = detectStatusFromFields(
+        cleanType,
+        room,
+        combinedNotes,
+        '',
+        cleanSubject
+      );
 
       items.push({
         id: `uek-xml-${date}-${startTime}-${index++}`,
@@ -473,17 +628,13 @@ export function parseUekXmlOrHtml(
         dayOfWeek: dayOfWeek || getPolishDayShort(date),
         startTime,
         endTime: endTime || '10:30',
-        subject,
-        type,
-        normalizedType: normalizeClassType(type),
+        subject: cleanSubject,
+        type: cleanType,
+        normalizedType: normalizeClassType(cleanType),
         lecturer,
         lecturerId: moidMatch ? moidMatch[1] : undefined,
         room,
-        rawNotes: rawNotes
-          ? rawNotes.toLowerCase().startsWith('uwagi')
-            ? rawNotes
-            : `Uwagi: ${rawNotes}`
-          : '',
+        rawNotes: combinedNotes,
         ...statusInfo,
       });
     }
@@ -506,14 +657,13 @@ export function parseUekXmlOrHtml(
     }
   }
 
-  // 2. Try HTML table parsing from planzajec.uek.krakow.pl (supports both 6-col combined day+time and 7/8-col tables)
+  // 2. Try HTML table parsing from planzajec.uek.krakow.pl (supports 6-col, 7/8-col, <br> Uwagi inside Forma, and follow-up Uwagi rows)
   if (trimmed.includes('<table') && trimmed.includes('<tr')) {
     const items: ScheduleItem[] = [];
     const trRegex = /<tr([^>]*)>([\s\S]*?)<\/tr>/gi;
     let trMatch: RegExpExecArray | null;
     let idx = 0;
 
-    // Extract group name from heading if present in HTML
     const headingMatch =
       trimmed.match(/<div[^>]*class=["'][^"']*grupa[^"']*["'][^>]*>([\s\S]*?)<\/div>/i) ||
       trimmed.match(/<h[123][^>]*>([\s\S]*?)<\/h[123]>/i);
@@ -527,26 +677,62 @@ export function parseUekXmlOrHtml(
       if (rowContent.includes('<th')) continue;
 
       const tds: string[] = [];
+      const rawTdsHtml: string[] = [];
       const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
       let tdMatch: RegExpExecArray | null;
       while ((tdMatch = tdRegex.exec(rowContent)) !== null) {
-        tds.push(
-          decodeHtmlEntities(tdMatch[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' '))
-        );
+        rawTdsHtml.push(tdMatch[1]);
+        const withNewlines = tdMatch[1]
+          .replace(/<br\s*\/?>/gi, '\n')
+          .replace(/<\/p>|<\/div>/gi, '\n')
+          .replace(/<[^>]+>/g, ' ');
+        const cleanedLines = withNewlines
+          .split('\n')
+          .map((line) => decodeHtmlEntities(line.replace(/\s+/g, ' ')))
+          .filter(Boolean);
+        tds.push(cleanedLines.join('\n'));
       }
 
       if (tds.length >= 5) {
-        const dateCandidate = tds[0];
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateCandidate)) continue;
+        const dateCandidate = (tds[0] || '').trim().slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dateCandidate)) {
+          // Check if this row is a standalone note row for the previous class
+          const joinedRow = tds.join(' ').trim();
+          if (
+            items.length > 0 &&
+            (joinedRow.toLowerCase().includes('uwagi') ||
+              joinedRow.toLowerCase().includes('przeniesion') ||
+              joinedRow.toLowerCase().includes('odwołan'))
+          ) {
+            const prev = items[items.length - 1];
+            const { combinedNotes } = extractCleanTypeAndNotes(
+              prev.type,
+              prev.rawNotes ? `${prev.rawNotes} · ${joinedRow}` : joinedRow,
+              prev.subject,
+              prev.room
+            );
+            const st = detectStatusFromFields(
+              prev.type,
+              prev.room,
+              combinedNotes,
+              trAttrs,
+              prev.subject
+            );
+            prev.rawNotes = combinedNotes;
+            prev.status = st.status;
+            prev.statusReason = st.statusReason;
+          }
+          continue;
+        }
 
         let dayOfWeek = getPolishDayShort(dateCandidate);
         let startTime = '08:00';
         let endTime = '10:30';
-        let subject = 'Przedmiot UEK';
-        let type = 'wykład';
+        let rawSubject = 'Przedmiot UEK';
+        let rawType = 'wykład';
         let lecturer = '';
         let rawRoom = 'Online';
-        let rawNotes = '';
+        let rawNotesInput = '';
 
         // Check if tds[1] combines day + time range (e.g. "Pt 15:45 - 18:15 (3 godz.)")
         const combinedTimeParts = (tds[1] || '').match(/(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})/);
@@ -557,31 +743,48 @@ export function parseUekXmlOrHtml(
           if (dayPrefix && dayPrefix.length <= 3) {
             dayOfWeek = dayPrefix;
           }
-          subject = tds[2] || 'Przedmiot UEK';
-          type = tds[3] || 'wykład';
-          lecturer = tds[4] || '';
-          rawRoom = tds[5] || 'Online';
-          rawNotes = tds[6] || '';
+          rawSubject = tds[2] || 'Przedmiot UEK';
+          rawType = tds[3] || 'wykład';
+          lecturer = (tds[4] || '').replace(/\n/g, ' ');
+          rawRoom =
+            rawTdsHtml[5] && /<a\s+[^>]*href=/i.test(rawTdsHtml[5])
+              ? decodeHtmlEntities(rawTdsHtml[5])
+              : (tds[5] || 'Online').replace(/\n/g, ' ');
+          rawNotesInput = tds[6] || '';
         } else {
-          dayOfWeek = tds[1] || getPolishDayShort(dateCandidate);
+          dayOfWeek = (tds[1] || getPolishDayShort(dateCandidate)).trim();
           const timeRange = tds[2] || '';
           const timeParts = timeRange.match(/(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})/);
           startTime = timeParts ? timeParts[1] : '08:00';
           endTime = timeParts ? timeParts[2] : '10:30';
-          subject = tds[3] || 'Przedmiot UEK';
-          type = tds[4] || 'wykład';
-          lecturer = tds[5] || '';
-          rawRoom = tds[6] || 'Online';
-          rawNotes = tds[7] || '';
+          rawSubject = tds[3] || 'Przedmiot UEK';
+          rawType = tds[4] || 'wykład';
+          lecturer = (tds[5] || '').replace(/\n/g, ' ');
+          rawRoom =
+            rawTdsHtml[6] && /<a\s+[^>]*href=/i.test(rawTdsHtml[6])
+              ? decodeHtmlEntities(rawTdsHtml[6])
+              : (tds[6] || 'Online').replace(/\n/g, ' ');
+          rawNotesInput = tds[7] || '';
         }
+
+        const { cleanType, cleanSubject, combinedNotes } =
+          extractCleanTypeAndNotes(rawType, rawNotesInput, rawSubject, rawRoom);
 
         const room =
           rawRoom.toLowerCase().includes('zdalny') ||
           rawRoom.toLowerCase().includes('moodle')
-            ? 'Online'
+            ? rawRoom.includes('href=')
+              ? rawRoom
+              : 'Online'
             : rawRoom;
 
-        const statusInfo = detectStatusFromFields(type, room, rawNotes, trAttrs);
+        const statusInfo = detectStatusFromFields(
+          cleanType,
+          room,
+          combinedNotes,
+          trAttrs,
+          cleanSubject
+        );
 
         items.push({
           id: `uek-html-${dateCandidate}-${startTime}-${idx++}`,
@@ -589,18 +792,39 @@ export function parseUekXmlOrHtml(
           dayOfWeek,
           startTime,
           endTime,
-          subject,
-          type,
-          normalizedType: normalizeClassType(type),
+          subject: cleanSubject,
+          type: cleanType,
+          normalizedType: normalizeClassType(cleanType),
           lecturer,
           room,
-          rawNotes: rawNotes
-            ? rawNotes.toLowerCase().startsWith('uwagi')
-              ? rawNotes
-              : `Uwagi: ${rawNotes}`
-            : '',
+          rawNotes: combinedNotes,
           ...statusInfo,
         });
+      } else if (tds.length >= 1 && items.length > 0) {
+        const joinedRow = tds.join(' ').trim();
+        if (
+          joinedRow.toLowerCase().includes('uwagi') ||
+          joinedRow.toLowerCase().includes('przeniesion') ||
+          joinedRow.toLowerCase().includes('odwołan')
+        ) {
+          const prev = items[items.length - 1];
+          const { combinedNotes } = extractCleanTypeAndNotes(
+            prev.type,
+            prev.rawNotes ? `${prev.rawNotes} · ${joinedRow}` : joinedRow,
+            prev.subject,
+            prev.room
+          );
+          const st = detectStatusFromFields(
+            prev.type,
+            prev.room,
+            combinedNotes,
+            trAttrs,
+            prev.subject
+          );
+          prev.rawNotes = combinedNotes;
+          prev.status = st.status;
+          prev.statusReason = st.statusReason;
+        }
       }
     }
 
@@ -626,12 +850,39 @@ export function parseUekXmlOrHtml(
     }
   }
 
-  // 3. Try plain-text / TSV table parsing (e.g. copied from UEK schedule in browser)
-  const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  if (lines.length >= 2) {
+  // 3. Try plain-text / TSV table parsing (e.g. copied from UEK schedule in browser via Ctrl+A, Ctrl+C)
+  const rawLines = trimmed
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  if (rawLines.length >= 2) {
+    // Merge wrapped continuation lines (such as "Uwagi: z 8.11\tmgr Dominik Kuc\tPaw.A 214" that wrapped after <br>) into the preceding date row
+    const mergedLines: string[] = [];
+    const dateStartRegex = /^(\d{4}-\d{2}-\d{2}|\d{2}[.-]\d{2}[.-]\d{4})\b/;
+
+    for (const rawLine of rawLines) {
+      if (dateStartRegex.test(rawLine)) {
+        mergedLines.push(rawLine);
+      } else if (mergedLines.length > 0) {
+        const lower = rawLine.toLowerCase();
+        // Ignore obvious footer/header noise
+        if (
+          lower.startsWith('uniwersytet ekonomiczny') ||
+          lower.startsWith('plan zajęć') ||
+          lower.startsWith('termin\t') ||
+          lower.startsWith('wybierz okres') ||
+          lower.startsWith('copyright')
+        ) {
+          continue;
+        }
+        mergedLines[mergedLines.length - 1] += `\t${rawLine}`;
+      }
+    }
+
     const textItems: ScheduleItem[] = [];
     let idx = 0;
-    for (const line of lines) {
+    for (const line of mergedLines) {
       const dateMatch =
         line.match(/\b(\d{4}-\d{2}-\d{2})\b/) ||
         line.match(/\b(\d{2})[.-](\d{2})[.-](\d{4})\b/);
@@ -646,40 +897,65 @@ export function parseUekXmlOrHtml(
       const endTime = timeMatch[2];
 
       const cols = line.includes('\t')
-        ? line.split('\t').map((c) => c.trim()).filter(Boolean)
-        : line.split(/\s{2,}/).map((c) => c.trim()).filter(Boolean);
+        ? line
+            .split('\t')
+            .map((c) => c.trim())
+            .filter(Boolean)
+        : line
+            .split(/\s{2,}/)
+            .map((c) => c.trim())
+            .filter(Boolean);
 
-      let subject = 'Przedmiot UEK';
-      let type = 'Wykład';
+      let rawSubject = 'Przedmiot UEK';
+      let rawType = 'Wykład';
       let lecturer = '';
       let room = 'Online';
-      let rawNotes = '';
+      const extraNoteParts: string[] = [];
 
-      if (cols.length >= 4) {
+      if (cols.length >= 3) {
         const remainingCols = cols.filter(
           (c) =>
             !c.includes(startTime) &&
             !c.includes(date) &&
             !['Pn', 'Wt', 'Śr', 'Cz', 'Pt', 'Sb', 'Nd'].includes(c)
         );
-        if (remainingCols.length >= 1) subject = remainingCols[0];
-        if (remainingCols.length >= 2) {
-          const c1 = remainingCols[1].toLowerCase();
+
+        // Extract any standalone "Uwagi: ..." columns first so they don't shift lecturer/room columns!
+        const nonNoteCols: string[] = [];
+        for (const col of remainingCols) {
+          if (/^uwagi\s*:/i.test(col)) {
+            extraNoteParts.push(col);
+          } else {
+            nonNoteCols.push(col);
+          }
+        }
+
+        if (nonNoteCols.length >= 1) rawSubject = nonNoteCols[0];
+        if (nonNoteCols.length >= 2) {
+          const c1 = nonNoteCols[1].toLowerCase();
           if (
             c1.includes('wykład') ||
+            c1.includes('wyklad') ||
             c1.includes('ćwicz') ||
+            c1.includes('cwicz') ||
             c1.includes('lektorat') ||
             c1.includes('lab') ||
-            c1.includes('seminar')
+            c1.includes('seminar') ||
+            c1.includes('konwersat') ||
+            c1.includes('projekt')
           ) {
-            type = remainingCols[1];
-            if (remainingCols.length >= 3) lecturer = remainingCols[2];
-            if (remainingCols.length >= 4) room = remainingCols[3];
-            if (remainingCols.length >= 5) rawNotes = remainingCols[4];
+            rawType = nonNoteCols[1];
+            if (nonNoteCols.length >= 3) lecturer = nonNoteCols[2];
+            if (nonNoteCols.length >= 4) room = nonNoteCols[3];
+            if (nonNoteCols.length >= 5) {
+              extraNoteParts.push(...nonNoteCols.slice(4));
+            }
           } else {
-            lecturer = remainingCols[1];
-            if (remainingCols.length >= 3) room = remainingCols[2];
-            if (remainingCols.length >= 4) rawNotes = remainingCols[3];
+            lecturer = nonNoteCols[1];
+            if (nonNoteCols.length >= 3) room = nonNoteCols[2];
+            if (nonNoteCols.length >= 4) {
+              extraNoteParts.push(...nonNoteCols.slice(3));
+            }
           }
         }
       } else {
@@ -688,22 +964,37 @@ export function parseUekXmlOrHtml(
           .replace(timeMatch[0], '')
           .replace(/\b(Pn|Wt|Śr|Cz|Pt|Sb|Nd)\b/g, '')
           .trim();
-        if (cleanLine) subject = cleanLine.slice(0, 60);
+        if (cleanLine) rawSubject = cleanLine.slice(0, 80);
       }
 
-      const statusInfo = detectStatusFromFields(type, room, rawNotes);
+      const { cleanType, cleanSubject, combinedNotes } =
+        extractCleanTypeAndNotes(
+          rawType,
+          extraNoteParts.join(' · '),
+          rawSubject,
+          room
+        );
+
+      const statusInfo = detectStatusFromFields(
+        cleanType,
+        room,
+        combinedNotes,
+        '',
+        cleanSubject
+      );
+
       textItems.push({
         id: `uek-txt-${date}-${startTime}-${idx++}`,
         date,
         dayOfWeek: getPolishDayShort(date),
         startTime,
         endTime,
-        subject,
-        type,
-        normalizedType: normalizeClassType(type),
+        subject: cleanSubject,
+        type: cleanType,
+        normalizedType: normalizeClassType(cleanType),
         lecturer,
         room,
-        rawNotes,
+        rawNotes: combinedNotes,
         ...statusInfo,
       });
     }
@@ -1816,6 +2107,33 @@ function generateDynamicNiestacjonarneScheduleForGroup(
       });
     }
 
+    const sat1Note =
+      zIdx === 4
+        ? 'Uwagi: przeniesione na 7.11 (MS Teams)'
+        : zIdx === 5
+        ? 'Uwagi: przeniesione z 24.10'
+        : zIdx === 7
+        ? 'Uwagi: odrabianie zajęć z 14.11'
+        : '';
+
+    const sat2Note =
+      zIdx === 2
+        ? 'Uwagi: przeniesione na 17.10'
+        : zIdx === 3
+        ? 'Uwagi: przeniesione z 17.10'
+        : zIdx === 6
+        ? 'Uwagi: zmiana godziny (z 13:30)'
+        : '';
+
+    const sun2Note =
+      zIdx === 4
+        ? 'Uwagi: na 8.11 (MS Teams)'
+        : zIdx === 5
+        ? 'Uwagi: przeniesione na 15.11'
+        : zIdx === 8
+        ? 'Uwagi: kolokwium zaliczeniowe'
+        : '';
+
     // Saturday classes
     rawItems.push(
       {
@@ -1830,9 +2148,9 @@ function generateDynamicNiestacjonarneScheduleForGroup(
         lecturer: s1.lecturer,
         room: zIdx < 4 ? 'Online' : s1.cwRoom,
         isOnlineLocation: zIdx < 4,
-        rawNotes: zIdx === 4 ? 'Uwagi: kolokwium cząstkowe' : '',
-        status: zIdx === 4 ? 'rescheduled' : 'scheduled',
-        statusReason: zIdx === 4 ? 'Uwagi: kolokwium cząstkowe' : undefined,
+        rawNotes: sat1Note,
+        status: sat1Note ? 'rescheduled' : 'scheduled',
+        statusReason: sat1Note || undefined,
       },
       {
         id: `uek-${parsed.entityId}-${sat}-2`,
@@ -1846,9 +2164,9 @@ function generateDynamicNiestacjonarneScheduleForGroup(
         lecturer: s2.lecturer,
         room: s2.cwRoom,
         isOnlineLocation: false,
-        rawNotes: zIdx === 3 ? 'Uwagi: przeniesione z 17.10' : '',
-        status: zIdx === 3 ? 'rescheduled' : 'scheduled',
-        statusReason: zIdx === 3 ? 'Uwagi: przeniesione z 17.10' : undefined,
+        rawNotes: sat2Note,
+        status: sat2Note ? 'rescheduled' : 'scheduled',
+        statusReason: sat2Note || undefined,
       },
       {
         id: `uek-${parsed.entityId}-${sat}-3`,
@@ -1897,9 +2215,9 @@ function generateDynamicNiestacjonarneScheduleForGroup(
           lecturer: s3.lecturer,
           room: 'Online',
           isOnlineLocation: true,
-          rawNotes: zIdx === 4 ? 'Uwagi: na 8.11 (MS Teams)' : '',
-          status: zIdx === 4 ? 'rescheduled' : 'scheduled',
-          statusReason: zIdx === 4 ? 'Uwagi: na 8.11 (MS Teams)' : undefined,
+          rawNotes: sun2Note,
+          status: sun2Note ? 'rescheduled' : 'scheduled',
+          statusReason: sun2Note || undefined,
         }
       );
     }

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
 import {
   generateRealisticUekSchedule,
+  mergeScheduleNotes,
   parseUekUrl,
   parseUekXmlOrHtml,
 } from './src/utils/uekParser';
@@ -72,11 +73,26 @@ function safeHttpRequest(
             .map((c) => String(c).split(';')[0].trim())
             .filter(Boolean);
 
+          const rawBuf = Buffer.concat(chunks);
+          const contentType = String(res.headers['content-type'] || '').toLowerCase();
+          let bodyStr = rawBuf.toString('utf-8');
+          if (
+            contentType.includes('iso-8859-2') ||
+            bodyStr.includes('encoding="ISO-8859-2"') ||
+            bodyStr.includes('charset=iso-8859-2')
+          ) {
+            try {
+              bodyStr = new TextDecoder('iso-8859-2').decode(rawBuf);
+            } catch {
+              // fallback to utf-8
+            }
+          }
+
           resolve({
             status: res.statusCode || 200,
             headers: res.headers,
             cookies: cookieList,
-            body: Buffer.concat(chunks).toString('utf-8'),
+            body: bodyStr,
           });
         });
         res.on('error', reject);
@@ -114,26 +130,56 @@ function serializeCookieJar(jar: Record<string, string>): string {
 }
 
 async function performUekCasLoginAndFetch(
-  targetUrl: string,
+  xmlTargetUrl: string,
+  htmlTargetUrl: string,
   username: string,
   password: string
 ): Promise<{
-  body: string;
+  xmlBody: string;
+  htmlBody: string;
   sessionCookie?: string;
   casError?: string;
   networkClosed?: boolean;
 }> {
-  const cookieJar: Record<string, string> = {};
-  const serviceUrl = targetUrl;
-  const casLoginUrl = `https://logowanie.uek.krakow.pl/cas/login?service=${encodeURIComponent(
-    serviceUrl
-  )}`;
-
+  const casCookies: Record<string, string> = {};
+  const planCookies: Record<string, string> = {};
   const userAgent =
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15';
 
   try {
-    // Step 1: GET CAS login form to obtain execution token and cookies
+    let casLoginUrl = `https://logowanie.uek.krakow.pl/cas/login?service=${encodeURIComponent(
+      xmlTargetUrl
+    )}`;
+    try {
+      const initPlanRes = await safeHttpRequest(xmlTargetUrl, {
+        method: 'GET',
+        headers: {
+          'User-Agent': userAgent,
+          Accept: 'application/xml,text/xml,text/html,*/*;q=0.9',
+        },
+      });
+      mergeCookieJar(planCookies, initPlanRes.cookies);
+      const initLocRaw = initPlanRes.headers['location'];
+      const initLoc = Array.isArray(initLocRaw) ? initLocRaw[0] : initLocRaw;
+      if (initLoc && initLoc.includes('logowanie.uek.krakow.pl')) {
+        casLoginUrl = initLoc.startsWith('http')
+          ? initLoc
+          : new URL(initLoc, 'https://logowanie.uek.krakow.pl').toString();
+      } else if (
+        initPlanRes.status === 200 &&
+        (initPlanRes.body.includes('<plan-zajec') ||
+          initPlanRes.body.includes('<table'))
+      ) {
+        return {
+          xmlBody: initPlanRes.body,
+          htmlBody: '',
+          sessionCookie: serializeCookieJar(planCookies),
+        };
+      }
+    } catch {
+      // Proceed with default casLoginUrl
+    }
+
     const getRes = await safeHttpRequest(casLoginUrl, {
       method: 'GET',
       headers: {
@@ -142,13 +188,16 @@ async function performUekCasLoginAndFetch(
       },
     });
 
-    mergeCookieJar(cookieJar, getRes.cookies);
+    mergeCookieJar(casCookies, getRes.cookies);
     const loginHtml = getRes.body;
 
-    const execMatch = loginHtml.match(/name="execution"\s+value="([^"]+)"/i);
+    const execMatch =
+      loginHtml.match(/name=["']execution["'][^>]*value=["']([^"']+)["']/i) ||
+      loginHtml.match(/value=["']([^"']+)["'][^>]*name=["']execution["']/i);
     if (!execMatch) {
       return {
-        body: '',
+        xmlBody: '',
+        htmlBody: '',
         networkClosed: true,
         casError: 'Nie udało się pobrać tokenu autoryzacji z serwera CAS UEK.',
       };
@@ -156,66 +205,90 @@ async function performUekCasLoginAndFetch(
 
     const executionToken = execMatch[1];
 
-    // Step 2: Submit credentials to CAS login
     const formParams = new URLSearchParams();
     formParams.set('username', username.trim());
     formParams.set('password', password);
     formParams.set('execution', executionToken);
     formParams.set('_eventId', 'submit');
     formParams.set('geolocation', '');
+    formParams.set('deviceFingerprint', '2849104721');
 
     const postRes = await safeHttpRequest(casLoginUrl, {
       method: 'POST',
       headers: {
         'User-Agent': userAgent,
         'Content-Type': 'application/x-www-form-urlencoded',
-        Cookie: serializeCookieJar(cookieJar),
+        Cookie: serializeCookieJar(casCookies),
         Origin: 'https://logowanie.uek.krakow.pl',
         Referer: casLoginUrl,
       },
       body: formParams.toString(),
     });
 
-    mergeCookieJar(cookieJar, postRes.cookies);
+    mergeCookieJar(casCookies, postRes.cookies);
 
     const rawLoc = postRes.headers['location'];
-    const redirectLocation = Array.isArray(rawLoc) ? rawLoc[0] : rawLoc;
+    let redirectLocation = Array.isArray(rawLoc) ? rawLoc[0] : rawLoc;
+
+    if (!redirectLocation && postRes.body) {
+      const jsRedirectMatch =
+        postRes.body.match(
+          /window\.location(?:\.href)?\s*=\s*["']([^"']+ticket=[^"']+)["']/i
+        ) ||
+        postRes.body.match(/url=([^"'\s>]+ticket=[^"'\s>]+)/i) ||
+        postRes.body.match(/href=["']([^"']+ticket=ST-[^"']+)["']/i);
+      if (jsRedirectMatch) {
+        redirectLocation = jsRedirectMatch[1];
+      }
+    }
 
     if (!redirectLocation) {
-      const errorHtml = postRes.body;
+      const errorHtml = postRes.body || '';
       if (
         errorHtml.includes('Invalid credentials') ||
         errorHtml.includes('Nieprawidłowe') ||
-        errorHtml.includes('badCredentials')
+        errorHtml.includes('badCredentials') ||
+        errorHtml.includes('authenticationFailure') ||
+        errorHtml.includes('id="loginForm"')
       ) {
         return {
-          body: '',
+          xmlBody: '',
+          htmlBody: '',
           casError:
-            'Serwer CAS UEK odrzucił logowanie (sprawdź identyfikator/nr albumu i hasło lub użyj ciasteczka sesji PHPSESSID).',
+            'Serwer CAS UEK odrzucił logowanie (sprawdź identyfikator/nr albumu i hasło).',
         };
       }
       return {
-        body: '',
+        xmlBody: '',
+        htmlBody: '',
         networkClosed: true,
       };
     }
 
-    // Step 3: Follow ticket redirect to planzajec.uek.krakow.pl
     let currentUrl = redirectLocation.startsWith('http')
       ? redirectLocation
       : new URL(redirectLocation, 'https://logowanie.uek.krakow.pl').toString();
 
-    for (let hop = 0; hop < 5; hop++) {
+    let landedBody = '';
+
+    for (let hop = 0; hop < 6; hop++) {
+      const isCasHost = currentUrl.includes('logowanie.uek.krakow.pl');
+      const activeJar = isCasHost ? casCookies : planCookies;
+
       const hopRes = await safeHttpRequest(currentUrl, {
         method: 'GET',
         headers: {
           'User-Agent': userAgent,
-          Cookie: serializeCookieJar(cookieJar),
+          Cookie: serializeCookieJar(activeJar),
           Accept: 'application/xml,text/xml,text/html,*/*;q=0.9',
         },
       });
 
-      mergeCookieJar(cookieJar, hopRes.cookies);
+      if (isCasHost) {
+        mergeCookieJar(casCookies, hopRes.cookies);
+      } else {
+        mergeCookieJar(planCookies, hopRes.cookies);
+      }
 
       const nextRaw = hopRes.headers['location'];
       const nextLoc = Array.isArray(nextRaw) ? nextRaw[0] : nextRaw;
@@ -232,23 +305,63 @@ async function performUekCasLoginAndFetch(
         continue;
       }
 
-      const phpSessId = cookieJar['PHPSESSID']
-        ? `PHPSESSID=${cookieJar['PHPSESSID']}`
-        : serializeCookieJar(cookieJar);
+      landedBody = hopRes.body;
+      break;
+    }
 
-      return {
-        body: hopRes.body,
-        sessionCookie: phpSessId,
-      };
+    const phpSessId = planCookies['PHPSESSID']
+      ? `PHPSESSID=${planCookies['PHPSESSID']}`
+      : serializeCookieJar(planCookies);
+
+    let xmlBody = landedBody.includes('<plan-zajec') ? landedBody : '';
+    let htmlBody = landedBody.includes('<table') ? landedBody : '';
+
+    if (phpSessId) {
+      if (!xmlBody) {
+        try {
+          const xmlRes = await safeHttpRequest(xmlTargetUrl, {
+            method: 'GET',
+            headers: {
+              'User-Agent': userAgent,
+              Cookie: phpSessId,
+              Accept: 'application/xml,text/xml,*/*;q=0.9',
+            },
+          });
+          if (xmlRes.body.includes('<plan-zajec')) {
+            xmlBody = xmlRes.body;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      if (!htmlBody) {
+        try {
+          const htmlRes = await safeHttpRequest(htmlTargetUrl, {
+            method: 'GET',
+            headers: {
+              'User-Agent': userAgent,
+              Cookie: phpSessId,
+              Accept: 'text/html,*/*;q=0.9',
+            },
+          });
+          if (htmlRes.body.includes('<table')) {
+            htmlBody = htmlRes.body;
+          }
+        } catch {
+          // ignore
+        }
+      }
     }
 
     return {
-      body: '',
-      networkClosed: true,
+      xmlBody,
+      htmlBody,
+      sessionCookie: phpSessId,
     };
   } catch {
     return {
-      body: '',
+      xmlBody: '',
+      htmlBody: '',
       networkClosed: true,
     };
   }
@@ -334,124 +447,127 @@ async function startServer() {
         }
         return res.status(400).json({
           error:
-            'Wklejony kod nie zawiera prawidłowej tabeli planu zajęć UEK ani struktury XML (<plan-zajec>). Upewnij się, że kopiujesz stronę po zalogowaniu do CAS.',
+            'Wklejone dane nie zawierają prawidłowej tabeli planu zajęć UEK ani struktury XML.',
         });
       }
 
-      // 2. Fetch with provided sessionCookie first if available
-      if (sessionCookie && typeof sessionCookie === 'string' && sessionCookie.trim()) {
-        const formattedCookie = sessionCookie.includes('=')
-          ? sessionCookie.trim()
-          : `PHPSESSID=${sessionCookie.trim()}`;
+      const effectiveCookie =
+        (sessionCookie && typeof sessionCookie === 'string' && sessionCookie.trim()) ||
+        process.env.UEK_SESSION_COOKIE ||
+        process.env.UEK_PHPSESSID ||
+        '';
+      const effectiveUsername =
+        (username && typeof username === 'string' && username.trim()) ||
+        process.env.UEK_CAS_USERNAME ||
+        '';
+      const effectivePassword =
+        (password && typeof password === 'string' && password) ||
+        process.env.UEK_CAS_PASSWORD ||
+        '';
 
-        for (const candidateUrl of [parsedUrl.xmlUrl, parsedUrl.cleanUrl]) {
-          try {
-            const resp = await safeHttpRequest(candidateUrl, {
-              headers: {
-                Cookie: formattedCookie,
-                'User-Agent':
-                  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15',
-              },
-            });
-            const parsedSchedule = parseUekXmlOrHtml(
-              resp.body,
-              parsedUrl.cleanUrl,
-              'cookie_session',
-              username || 'Sesja PHPSESSID'
-            );
-            if (parsedSchedule) {
-              return res.json({
-                ...parsedSchedule,
-                sessionCookie: formattedCookie,
-              });
-            }
-          } catch {
-            // Continue to next candidate or CAS fallback
-          }
+      // 2. Fetch with provided sessionCookie first if available
+      if (effectiveCookie) {
+        const formattedCookie = effectiveCookie.includes('=')
+          ? effectiveCookie.trim()
+          : `PHPSESSID=${effectiveCookie.trim()}`;
+
+        let xmlParsed = null;
+        let htmlParsed = null;
+
+        try {
+          const xmlResp = await safeHttpRequest(parsedUrl.xmlUrl, {
+            headers: {
+              Cookie: formattedCookie,
+              'User-Agent':
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15',
+            },
+          });
+          xmlParsed = parseUekXmlOrHtml(
+            xmlResp.body,
+            parsedUrl.cleanUrl,
+            'cookie_session',
+            effectiveUsername || 'Sesja CAS'
+          );
+        } catch {
+          // continue
         }
 
-        if (!username || !password) {
-          const syncedFallback = generateRealisticUekSchedule(
+        try {
+          const htmlResp = await safeHttpRequest(parsedUrl.cleanUrl, {
+            headers: {
+              Cookie: formattedCookie,
+              'User-Agent':
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15',
+            },
+          });
+          htmlParsed = parseUekXmlOrHtml(
+            htmlResp.body,
             parsedUrl.cleanUrl,
-            undefined,
             'cookie_session',
-            undefined,
-            major
+            effectiveUsername || 'Sesja CAS'
           );
-          syncedFallback.metadata.casUser = 'Sesja PHPSESSID';
+        } catch {
+          // continue
+        }
+
+        const finalSchedule =
+          xmlParsed && htmlParsed
+            ? mergeScheduleNotes(xmlParsed, htmlParsed)
+            : xmlParsed || htmlParsed;
+
+        if (finalSchedule) {
           return res.json({
-            ...syncedFallback,
+            ...finalSchedule,
             sessionCookie: formattedCookie,
           });
         }
       }
 
       // 3. Real CAS login flow with username & password
-      if (username && password) {
-        const xmlAttempt = await performUekCasLoginAndFetch(
+      if (effectiveUsername && effectivePassword) {
+        const attempt = await performUekCasLoginAndFetch(
           parsedUrl.xmlUrl,
-          username,
-          password
+          parsedUrl.cleanUrl,
+          effectiveUsername,
+          effectivePassword
         );
 
-        if (xmlAttempt.body) {
-          const parsedSchedule = parseUekXmlOrHtml(
-            xmlAttempt.body,
-            parsedUrl.cleanUrl,
-            'cas_authenticated',
-            username
-          );
-          if (parsedSchedule) {
-            return res.json({
-              ...parsedSchedule,
-              sessionCookie: xmlAttempt.sessionCookie,
-            });
-          }
-        }
-
-        // Only try second request if first didn't already report explicit bad credentials or closed socket
-        if (!xmlAttempt.casError && !xmlAttempt.networkClosed) {
-          const htmlAttempt = await performUekCasLoginAndFetch(
-            parsedUrl.cleanUrl,
-            username,
-            password
-          );
-          if (htmlAttempt.body) {
-            const parsedSchedule = parseUekXmlOrHtml(
-              htmlAttempt.body,
+        const xmlParsed = attempt.xmlBody
+          ? parseUekXmlOrHtml(
+              attempt.xmlBody,
               parsedUrl.cleanUrl,
               'cas_authenticated',
-              username
-            );
-            if (parsedSchedule) {
-              return res.json({
-                ...parsedSchedule,
-                sessionCookie: htmlAttempt.sessionCookie,
-              });
-            }
-          }
-          if (htmlAttempt.casError && !htmlAttempt.networkClosed) {
-            return res.status(401).json({
-              error: htmlAttempt.casError,
-            });
-          }
-        }
+              effectiveUsername
+            )
+          : null;
 
-        if (xmlAttempt.casError && !xmlAttempt.networkClosed) {
-          return res.status(401).json({
-            error: xmlAttempt.casError,
+        const htmlParsed = attempt.htmlBody
+          ? parseUekXmlOrHtml(
+              attempt.htmlBody,
+              parsedUrl.cleanUrl,
+              'cas_authenticated',
+              effectiveUsername
+            )
+          : null;
+
+        const finalSchedule =
+          xmlParsed && htmlParsed
+            ? mergeScheduleNotes(xmlParsed, htmlParsed)
+            : xmlParsed || htmlParsed;
+
+        if (finalSchedule) {
+          return res.json({
+            ...finalSchedule,
+            sessionCookie: attempt.sessionCookie,
           });
         }
 
-        const authenticatedFallback = generateRealisticUekSchedule(
-          parsedUrl.cleanUrl,
-          undefined,
-          'cas_authenticated',
-          username.trim(),
-          major
-        );
-        authenticatedFallback.metadata.casUser = username.trim();
-        return res.json(authenticatedFallback);
+        if (attempt.casError && !attempt.networkClosed) {
+          return res.status(401).json({
+            error: attempt.casError,
+            requiresCasAuth: true,
+          });
+        }
       }
 
       // 4. Unauthenticated fetch attempt -> try both XML and HTML endpoints
@@ -484,7 +600,10 @@ async function startServer() {
         major
       );
 
-      return res.json(demoSchedule);
+      return res.json({
+        ...demoSchedule,
+        requiresCasAuth: true,
+      });
     } catch {
       const reqUrl =
         req.body?.url || 'https://planzajec.uek.krakow.pl/index.php?typ=G&id=259441&okres=3';
@@ -495,7 +614,10 @@ async function startServer() {
         undefined,
         req.body?.major
       );
-      return res.json(fallback);
+      return res.json({
+        ...fallback,
+        requiresCasAuth: true,
+      });
     }
   });
 

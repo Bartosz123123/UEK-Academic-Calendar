@@ -53,20 +53,19 @@ interface CasAuthModalProps {
   onResetToDefaultSchedule: () => void;
 }
 
-const BOOKMARKLET_CODE = `javascript:(function(){try{var rows=Array.from(document.querySelectorAll('table tr')).slice(1).map(function(tr){var td=Array.from(tr.querySelectorAll('td')).map(function(c){return c.innerText.trim()});return td.length>=5?{termin:td[0],dzien:td[1],od:(td[2].match(/\\d{2}:\\d{2}/g)||[])[0]||'',do:(td[2].match(/\\d{2}:\\d{2}/g)||[])[1]||'',przedmiot:td[3],forma:td[4],nauczyciel:td[5]||'',sala:td[6]||'',uwagi:td[7]||''}:null}).filter(Boolean);var json=JSON.stringify(rows.length?rows:document.documentElement.outerHTML);navigator.clipboard.writeText(json).then(function(){alert('Skopiowano plan UEK ('+rows.length+' zajęć)! Wróć do aplikacji i wklej w polu tekstowym.')})}catch(e){alert('Skopiuj kod strony ręcznie (Ctrl+A, Ctrl+C)')}})();`;
+const BOOKMARKLET_CODE = `javascript:(function(){try{var rows=Array.from(document.querySelectorAll('table tr')).slice(1).map(function(tr){var td=Array.from(tr.querySelectorAll('td')).map(function(c){return c.innerText.trim()});if(td.length===6){var m=td[1].match(/(\\d{2}:\\d{2})/g)||[];var fp=td[3].split(/\\n+/);return{termin:td[0],dzien:td[1],od:m[0]||'',do:m[1]||'',przedmiot:td[2],forma:fp[0]||td[3],nauczyciel:td[4]||'',sala:td[5]||'',uwagi:fp.slice(1).join(' ')||''}}return td.length>=5?{termin:td[0],dzien:td[1],od:(td[2].match(/\\d{2}:\\d{2}/g)||[])[0]||'',do:(td[2].match(/\\d{2}:\\d{2}/g)||[])[1]||'',przedmiot:td[3],forma:td[4],nauczyciel:td[5]||'',sala:td[6]||'',uwagi:td[7]||''}:null}).filter(Boolean);var json=JSON.stringify(rows.length?rows:document.documentElement.outerHTML);navigator.clipboard.writeText(json).then(function(){alert('Skopiowano plan UEK ('+rows.length+' zajęć)! Wróć do aplikacji i wklej.')})}catch(e){alert('Skopiuj tabelę ręcznie (Ctrl+A, Ctrl+C)')}})();`;
 
 export const CasAuthModal: React.FC<CasAuthModalProps> = ({
   isOpen,
   onClose,
   currentUrl,
-  onUpdateUrl,
   selectedMajor,
   onSelectMajor,
   languageUrl,
   onUpdateLanguageConfig,
   customLangRoom,
   customLangLecturer,
-  authMode,
+  casUser,
   onLoginSubmit,
   onResetToDefaultSchedule,
 }) => {
@@ -84,9 +83,9 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
   const [lecturerInput, setLecturerInput] =
     useState<string>(customLangLecturer);
 
-  const [showAdvanced, setShowAdvanced] = useState<boolean>(false);
-  const [proxyUrl, setProxyUrl] = useState<string>('');
-  const [casIndex, setCasIndex] = useState<string>('');
+  const [showAdvanced, setShowAdvanced] = useState<boolean>(true);
+  const [proxyUrl] = useState<string>('');
+  const [casIndex, setCasIndex] = useState<string>(casUser || '');
   const [casPassword, setCasPassword] = useState<string>('');
   const [rawText, setRawText] = useState<string>('');
   const [isDragging, setIsDragging] = useState<boolean>(false);
@@ -105,17 +104,27 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
       setLangLinkValue(languageUrl);
       setRoomInput(customLangRoom);
       setLecturerInput(customLangLecturer);
+      if (casUser && !casIndex) {
+        setCasIndex(casUser);
+      }
       setStatusMessage(null);
     }
-  }, [isOpen, currentUrl, selectedMajor, languageUrl, customLangRoom, customLangLecturer]);
+  }, [isOpen, currentUrl, selectedMajor, languageUrl, customLangRoom, customLangLecturer, casUser, casIndex]);
 
   if (!isOpen) return null;
 
   const trimmedLink = linkValue.trim();
+  const isRawScheduleInLinkBox =
+    trimmedLink.length > 40 &&
+    !trimmedLink.startsWith('http') &&
+    (/\d{4}-\d{2}-\d{2}/.test(trimmedLink) ||
+      trimmedLink.includes('BEGIN:VCALENDAR') ||
+      trimmedLink.includes('<plan-zajec') ||
+      trimmedLink.includes('<table'));
   const parsed = parseUekUrl(trimmedLink);
   const isEmpty = trimmedLink.length === 0;
-  const isValidLink = !isEmpty && parsed.isValid;
-  const isInvalidLink = !isEmpty && !parsed.isValid;
+  const isValidLink = !isEmpty && (parsed.isValid || isRawScheduleInLinkBox);
+  const isInvalidLink = !isEmpty && !parsed.isValid && !isRawScheduleInLinkBox;
 
   const trimmedLangLink = langLinkValue.trim();
   const parsedLang = parseUekUrl(trimmedLangLink);
@@ -131,6 +140,22 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
       const text = await navigator.clipboard.readText();
       if (text) {
         const cleaned = text.trim();
+        if (
+          cleaned.length > 40 &&
+          !cleaned.startsWith('http') &&
+          (/\d{4}-\d{2}-\d{2}/.test(cleaned) ||
+            cleaned.includes('BEGIN:VCALENDAR') ||
+            cleaned.includes('<plan-zajec') ||
+            cleaned.includes('<table'))
+        ) {
+          setRawText(cleaned);
+          setActiveTab('real_import');
+          setStatusMessage({
+            type: 'success',
+            text: 'Wykryto skopiowaną tabelę planu UEK w schowku — kliknij „Wczytaj oficjalny plan UEK”.',
+          });
+          return;
+        }
         setLinkValue(cleaned);
         const autoDetected = detectMajorFromUrlOrName(cleaned);
         if (autoDetected) {
@@ -169,6 +194,38 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
 
   const handleFetchFromLink = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // If user pasted raw schedule table directly into the link field, import it directly!
+    if (isRawScheduleInLinkBox) {
+      setIsSubmitting(true);
+      setStatusMessage(null);
+      try {
+        const res = await onLoginSubmit({
+          url: currentUrl || DEFAULT_UEK_URL,
+          rawXmlOrHtml: trimmedLink,
+          major: activeMajor,
+          rememberForAutoSync: false,
+        });
+        if (res.ok) {
+          setStatusMessage({
+            type: 'success',
+            text: 'Pomyślnie wczytano zajęcia oraz przeniesienia z wklejonej tabeli!',
+          });
+          setTimeout(() => {
+            onClose();
+          }, 350);
+        } else {
+          setStatusMessage({
+            type: 'error',
+            text: res.error || 'Nie udało się rozpoznać wklejonych danych planu zajęć.',
+          });
+        }
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
+
     if (isInvalidLink) {
       setStatusMessage({
         type: 'error',
@@ -210,8 +267,6 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
         rememberForAutoSync: true,
       });
 
-      onUpdateUrl(targetUrl);
-
       if (res.ok) {
         setStatusMessage({
           type: 'success',
@@ -243,7 +298,7 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
     setIsSubmitting(true);
     setStatusMessage(null);
     try {
-      const targetUrl = isEmpty ? DEFAULT_UEK_URL : parsed.cleanUrl;
+      const targetUrl = isEmpty || isRawScheduleInLinkBox ? currentUrl || DEFAULT_UEK_URL : parsed.cleanUrl;
       const targetLangUrl = isLangEmpty ? '' : parsedLang.cleanUrl;
 
       onSelectMajor(activeMajor);
@@ -261,10 +316,9 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
       });
 
       if (res.ok) {
-        onUpdateUrl(targetUrl);
         setStatusMessage({
           type: 'success',
-          text: 'Pomyślnie wczytano oficjalne zajęcia z UEK!',
+          text: 'Pomyślnie wczytano oficjalne zajęcia i uwagi z UEK!',
         });
         setTimeout(() => {
           onClose();
@@ -287,7 +341,7 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
       const content = await file.text();
       setRawText(content);
       setIsSubmitting(true);
-      const targetUrl = isEmpty ? DEFAULT_UEK_URL : parsed.cleanUrl;
+      const targetUrl = isEmpty || isRawScheduleInLinkBox ? currentUrl || DEFAULT_UEK_URL : parsed.cleanUrl;
       onSelectMajor(activeMajor);
 
       const res = await onLoginSubmit({
@@ -298,7 +352,6 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
       });
       setIsSubmitting(false);
       if (res.ok) {
-        onUpdateUrl(targetUrl);
         setStatusMessage({
           type: 'success',
           text: `Wczytano plan z pliku ${file.name}!`,
