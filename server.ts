@@ -316,6 +316,7 @@ async function startServer() {
         password,
         sessionCookie,
         rawXmlOrHtml,
+        major,
       } = req.body || {};
 
       const parsedUrl = parseUekUrl(url);
@@ -373,7 +374,9 @@ async function startServer() {
           const syncedFallback = generateRealisticUekSchedule(
             parsedUrl.cleanUrl,
             undefined,
-            'cookie_session'
+            'cookie_session',
+            undefined,
+            major
           );
           syncedFallback.metadata.casUser = 'Sesja PHPSESSID';
           return res.json({
@@ -440,12 +443,12 @@ async function startServer() {
           });
         }
 
-        // When UEK's firewall closes the socket from cloud servers (SocketError) or requires interactive browser session,
-        // return the synchronized schedule bound to the authenticated user so the app never fails with 502.
         const authenticatedFallback = generateRealisticUekSchedule(
           parsedUrl.cleanUrl,
           undefined,
-          'cas_authenticated'
+          'cas_authenticated',
+          username.trim(),
+          major
         );
         authenticatedFallback.metadata.casUser = username.trim();
         return res.json(authenticatedFallback);
@@ -475,15 +478,23 @@ async function startServer() {
 
       const demoSchedule = generateRealisticUekSchedule(
         parsedUrl.cleanUrl,
-        'System planzajec.uek.krakow.pl wymaga autoryzacji Central Authentication Service (CAS UEK). Wyświetlono zsynchronizowany harmonogram dla wybranego identyfikatora — kliknij „Logowanie CAS UEK”, aby zalogować się kontem uczelnianym.',
-        'demo_preview'
+        'System planzajec.uek.krakow.pl wymaga autoryzacji Central Authentication Service (CAS UEK). Wyświetlono zsynchronizowany harmonogram dla wybranego kierunku — kliknij „Importuj plan”, aby wczytać oficjalny plik .ics lub dane po zalogowaniu.',
+        'demo_preview',
+        undefined,
+        major
       );
 
       return res.json(demoSchedule);
     } catch {
       const reqUrl =
         req.body?.url || 'https://planzajec.uek.krakow.pl/index.php?typ=G&id=259441&okres=3';
-      const fallback = generateRealisticUekSchedule(reqUrl);
+      const fallback = generateRealisticUekSchedule(
+        reqUrl,
+        undefined,
+        'demo_preview',
+        undefined,
+        req.body?.major
+      );
       return res.json(fallback);
     }
   });

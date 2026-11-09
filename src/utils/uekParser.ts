@@ -626,6 +626,106 @@ export function parseUekXmlOrHtml(
     }
   }
 
+  // 3. Try plain-text / TSV table parsing (e.g. copied from UEK schedule in browser)
+  const lines = trimmed.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length >= 2) {
+    const textItems: ScheduleItem[] = [];
+    let idx = 0;
+    for (const line of lines) {
+      const dateMatch =
+        line.match(/\b(\d{4}-\d{2}-\d{2})\b/) ||
+        line.match(/\b(\d{2})[.-](\d{2})[.-](\d{4})\b/);
+      const timeMatch = line.match(/(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})/);
+      if (!dateMatch || !timeMatch) continue;
+
+      let date = dateMatch[1];
+      if (dateMatch[3]) {
+        date = `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}`;
+      }
+      const startTime = timeMatch[1];
+      const endTime = timeMatch[2];
+
+      const cols = line.includes('\t')
+        ? line.split('\t').map((c) => c.trim()).filter(Boolean)
+        : line.split(/\s{2,}/).map((c) => c.trim()).filter(Boolean);
+
+      let subject = 'Przedmiot UEK';
+      let type = 'Wykład';
+      let lecturer = '';
+      let room = 'Online';
+      let rawNotes = '';
+
+      if (cols.length >= 4) {
+        const remainingCols = cols.filter(
+          (c) =>
+            !c.includes(startTime) &&
+            !c.includes(date) &&
+            !['Pn', 'Wt', 'Śr', 'Cz', 'Pt', 'Sb', 'Nd'].includes(c)
+        );
+        if (remainingCols.length >= 1) subject = remainingCols[0];
+        if (remainingCols.length >= 2) {
+          const c1 = remainingCols[1].toLowerCase();
+          if (
+            c1.includes('wykład') ||
+            c1.includes('ćwicz') ||
+            c1.includes('lektorat') ||
+            c1.includes('lab') ||
+            c1.includes('seminar')
+          ) {
+            type = remainingCols[1];
+            if (remainingCols.length >= 3) lecturer = remainingCols[2];
+            if (remainingCols.length >= 4) room = remainingCols[3];
+            if (remainingCols.length >= 5) rawNotes = remainingCols[4];
+          } else {
+            lecturer = remainingCols[1];
+            if (remainingCols.length >= 3) room = remainingCols[2];
+            if (remainingCols.length >= 4) rawNotes = remainingCols[3];
+          }
+        }
+      } else {
+        const cleanLine = line
+          .replace(dateMatch[0], '')
+          .replace(timeMatch[0], '')
+          .replace(/\b(Pn|Wt|Śr|Cz|Pt|Sb|Nd)\b/g, '')
+          .trim();
+        if (cleanLine) subject = cleanLine.slice(0, 60);
+      }
+
+      const statusInfo = detectStatusFromFields(type, room, rawNotes);
+      textItems.push({
+        id: `uek-txt-${date}-${startTime}-${idx++}`,
+        date,
+        dayOfWeek: getPolishDayShort(date),
+        startTime,
+        endTime,
+        subject,
+        type,
+        normalizedType: normalizeClassType(type),
+        lecturer,
+        room,
+        rawNotes,
+        ...statusInfo,
+      });
+    }
+
+    if (textItems.length > 0) {
+      return {
+        metadata: {
+          sourceUrl: parsedUrl.cleanUrl,
+          typ: parsedUrl.typ,
+          entityId: parsedUrl.entityId,
+          okres: parsedUrl.okres,
+          groupName: `grupa ${parsedUrl.entityId}`,
+          groupFullName: `UEK Kraków · niestacjonarne · grupa ${parsedUrl.entityId}`,
+          authMode: 'raw_import',
+          casUser: casUser || 'Import z tabeli',
+          fetchedAt: new Date().toISOString(),
+        },
+        items: enrichWithCountersAndHours(textItems),
+      };
+    }
+  }
+
   return null;
 }
 
@@ -741,18 +841,23 @@ export function generateRealisticUekSchedule(
   sourceUrl: string,
   authWarning?: string,
   authMode: ScheduleMetadata['authMode'] = 'demo_preview',
-  casUser?: string
+  casUser?: string,
+  preferredMajor?: string
 ): ScheduleResponse {
   const parsed = parseUekUrl(sourceUrl);
+  const targetMajor = preferredMajor || detectMajorFromUrlOrName(sourceUrl);
 
-  // If the user entered any group/entity ID other than the default 259441 (e.g. id=170031),
-  // generate a deterministic, realistic niestacjonarne UEK schedule tailored to that exact group ID!
-  if (parsed.entityId && parsed.entityId !== '259441') {
+  // If user selected or link specifies a major other than informatyka, or entityId is not 259441:
+  if (
+    targetMajor !== 'informatyka' ||
+    (parsed.entityId && parsed.entityId !== '259441')
+  ) {
     return generateDynamicNiestacjonarneScheduleForGroup(
       parsed,
       authWarning,
       authMode,
-      casUser
+      casUser,
+      targetMajor
     );
   }
 
@@ -1381,11 +1486,108 @@ export function generateRealisticUekSchedule(
   };
 }
 
+export type MajorTrackId =
+  | 'finanse'
+  | 'informatyka'
+  | 'zarzadzanie'
+  | 'logistyka'
+  | 'ekonomia';
+
+export interface MajorOption {
+  id: MajorTrackId;
+  name: string;
+  codePrefix: string;
+  shortDesc: string;
+}
+
+export const AVAILABLE_MAJORS: MajorOption[] = [
+  {
+    id: 'finanse',
+    name: 'Finanse i Rachunkowość',
+    codePrefix: 'KFiR',
+    shortDesc: 'Rachunkowość finansowa, rynki finansowe, podatki, finanse przedsiębiorstw',
+  },
+  {
+    id: 'informatyka',
+    name: 'Informatyka Stosowana',
+    codePrefix: 'KIS',
+    shortDesc: 'Inżynieria systemów, programowanie, bazy danych SQL, technologie mobilne i webowe',
+  },
+  {
+    id: 'zarzadzanie',
+    name: 'Zarządzanie i Analityka Biznesowa',
+    codePrefix: 'KZiAB',
+    shortDesc: 'Zarządzanie projektami, Business Intelligence, controlling, negocjacje',
+  },
+  {
+    id: 'logistyka',
+    name: 'Logistyka i Handel Międzynarodowy',
+    codePrefix: 'KLiHM',
+    shortDesc: 'SCM, systemy ERP SAP, transport i spedycja, handel zagraniczny',
+  },
+  {
+    id: 'ekonomia',
+    name: 'Ekonomia i Gospodarka Cyfrowa',
+    codePrefix: 'KEiGC',
+    shortDesc: 'Makroekonomia, ekonometria, rynki cyfrowe, polityka monetarna',
+  },
+];
+
+export function detectMajorFromUrlOrName(input?: string): MajorTrackId {
+  if (!input) return 'finanse';
+  const lower = input.toLowerCase();
+  if (
+    lower.includes('170031') ||
+    lower.includes('finan') ||
+    lower.includes('kfir') ||
+    lower.includes('fir') ||
+    lower.includes('rachun')
+  ) {
+    return 'finanse';
+  }
+  if (
+    lower.includes('259441') ||
+    lower.includes('inf') ||
+    lower.includes('kis') ||
+    lower.includes('komp') ||
+    lower.includes('program')
+  ) {
+    return 'informatyka';
+  }
+  if (
+    lower.includes('zarz') ||
+    lower.includes('ziab') ||
+    lower.includes('kziab') ||
+    lower.includes('manag')
+  ) {
+    return 'zarzadzanie';
+  }
+  if (
+    lower.includes('logist') ||
+    lower.includes('klihm') ||
+    lower.includes('lihm') ||
+    lower.includes('transp') ||
+    lower.includes('sped')
+  ) {
+    return 'logistyka';
+  }
+  if (
+    lower.includes('ekonom') ||
+    lower.includes('keigc') ||
+    lower.includes('eigc') ||
+    lower.includes('gospodar')
+  ) {
+    return 'ekonomia';
+  }
+  return 'finanse';
+}
+
 function generateDynamicNiestacjonarneScheduleForGroup(
   parsed: ParsedUekUrl,
   authWarning?: string,
   authMode: ScheduleMetadata['authMode'] = 'demo_preview',
-  casUser?: string
+  casUser?: string,
+  preferredMajor?: string
 ): ScheduleResponse {
   const seed =
     parsed.entityId
@@ -1394,6 +1596,7 @@ function generateDynamicNiestacjonarneScheduleForGroup(
 
   const uekTracks = [
     {
+      id: 'finanse' as MajorTrackId,
       majorName: 'Finanse i Rachunkowość',
       codePrefix: 'KFiR',
       subjects: [
@@ -1404,7 +1607,7 @@ function generateDynamicNiestacjonarneScheduleForGroup(
         },
         {
           name: 'Analiza rynków finansowych',
-          lecturer: 'dr MarcinBąk',
+          lecturer: 'dr Marcin Bąk',
           cwRoom: 'Paw.A 215 lab. komputerowe',
         },
         {
@@ -1422,9 +1625,15 @@ function generateDynamicNiestacjonarneScheduleForGroup(
           lecturer: 'dr Piotr Wójcik',
           cwRoom: 'Paw.A 119 lab. komputerowe',
         },
+        {
+          name: 'Bankowość i rynki kapitałowe',
+          lecturer: 'prof. dr hab. Ewa Miklaszewska',
+          cwRoom: 'Paw.C 102',
+        },
       ],
     },
     {
+      id: 'zarzadzanie' as MajorTrackId,
       majorName: 'Zarządzanie i Analityka Biznesowa',
       codePrefix: 'KZiAB',
       subjects: [
@@ -1456,8 +1665,9 @@ function generateDynamicNiestacjonarneScheduleForGroup(
       ],
     },
     {
-      majorName: 'Informatyka i Ekonometria',
-      codePrefix: 'KIiE',
+      id: 'informatyka' as MajorTrackId,
+      majorName: 'Informatyka Stosowana',
+      codePrefix: 'KIS',
       subjects: [
         {
           name: 'Inżynieria oprogramowania i architektura systemów',
@@ -1487,6 +1697,7 @@ function generateDynamicNiestacjonarneScheduleForGroup(
       ],
     },
     {
+      id: 'logistyka' as MajorTrackId,
       majorName: 'Logistyka i Handel Międzynarodowy',
       codePrefix: 'KLiHM',
       subjects: [
@@ -1517,9 +1728,48 @@ function generateDynamicNiestacjonarneScheduleForGroup(
         },
       ],
     },
+    {
+      id: 'ekonomia' as MajorTrackId,
+      majorName: 'Ekonomia i Gospodarka Cyfrowa',
+      codePrefix: 'KEiGC',
+      subjects: [
+        {
+          name: 'Makroekonomia gospodarki otwartej',
+          lecturer: 'dr hab. Andrzej Cieślik, prof. UEK',
+          cwRoom: 'Paw.B 152',
+        },
+        {
+          name: 'Ekonometria i analiza szeregów czasowych',
+          lecturer: 'prof. dr hab. Tadeusz Kufel',
+          cwRoom: 'Paw.A 215 lab.',
+        },
+        {
+          name: 'Rynki cyfrowe i transformacja technologiczna',
+          lecturer: 'dr hab. Piotr Stanek',
+          cwRoom: 'Paw.C 204',
+        },
+        {
+          name: 'Polityka gospodarcza i monetarna UE',
+          lecturer: 'dr hab. Joanna Stachel',
+          cwRoom: 'Paw.F 304',
+        },
+        {
+          name: 'Analiza danych makroekonomicznych w R/Python',
+          lecturer: 'dr Michał Bernardelli',
+          cwRoom: 'Paw.A 119 lab.',
+        },
+      ],
+    },
   ];
 
-  const track = uekTracks[seed % uekTracks.length];
+  const targetMajorId: MajorTrackId =
+    preferredMajor && ['finanse', 'informatyka', 'zarzadzanie', 'logistyka', 'ekonomia'].includes(preferredMajor)
+      ? (preferredMajor as MajorTrackId)
+      : detectMajorFromUrlOrName(parsed.cleanUrl);
+
+  const track =
+    uekTracks.find((t) => t.id === targetMajorId) ||
+    uekTracks[seed % uekTracks.length];
   const rawItems: ScheduleItem[] = [];
 
   UEK_12_ZJAZDY.forEach((zjazd, zIdx) => {

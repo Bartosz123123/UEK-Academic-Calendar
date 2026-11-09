@@ -16,9 +16,12 @@ import {
   ScheduleMetadata,
 } from './types/schedule';
 import {
+  AVAILABLE_MAJORS,
   DEFAULT_LANGUAGE_UEK_URL,
   DEFAULT_UEK_URL,
+  MajorTrackId,
   UEK_12_ZJAZDY,
+  detectMajorFromUrlOrName,
   enrichScheduleWithLanguageLink,
   generateRealisticUekSchedule,
   getDisplayCategoryLabel,
@@ -43,6 +46,7 @@ import {
 
 const STORAGE_OVERRIDES_KEY = 'uek_apple_schedule_overrides_v2';
 const STORAGE_URL_KEY = 'uek_apple_schedule_url_v2';
+const STORAGE_MAJOR_KEY = 'uek_apple_schedule_major_v1';
 const STORAGE_LANG_URL_KEY = 'uek_apple_schedule_lang_url_v2';
 const STORAGE_LANG_META_KEY = 'uek_apple_schedule_lang_meta_v2';
 const STORAGE_AUTH_KEY = 'uek_apple_schedule_auth_v2';
@@ -297,6 +301,26 @@ export default function App() {
     return saved !== null ? saved : DEFAULT_LANGUAGE_UEK_URL;
   });
 
+  // 1c. Selected major track (defaulting to Finanse i Rachunkowość or detected from URL)
+  const [selectedMajor, setSelectedMajor] = useState<MajorTrackId>(() => {
+    const saved = localStorage.getItem(STORAGE_MAJOR_KEY);
+    if (
+      saved &&
+      ['finanse', 'informatyka', 'zarzadzanie', 'logistyka', 'ekonomia'].includes(saved)
+    ) {
+      return saved as MajorTrackId;
+    }
+    return detectMajorFromUrlOrName(
+      localStorage.getItem(STORAGE_URL_KEY) || DEFAULT_UEK_URL
+    );
+  });
+
+  const selectedMajorRef = useRef(selectedMajor);
+  useEffect(() => {
+    selectedMajorRef.current = selectedMajor;
+    localStorage.setItem(STORAGE_MAJOR_KEY, selectedMajor);
+  }, [selectedMajor]);
+
   const [customLangMeta, setCustomLangMeta] = useState<{
     room?: string;
     lecturer?: string;
@@ -375,8 +399,15 @@ export default function App() {
 
   // 5. Schedule Data & Offline-First Persistence
   const initialFallback = useMemo(
-    () => generateRealisticUekSchedule(scheduleUrl),
-    [scheduleUrl]
+    () =>
+      generateRealisticUekSchedule(
+        scheduleUrl,
+        undefined,
+        'demo_preview',
+        undefined,
+        selectedMajor
+      ),
+    [scheduleUrl, selectedMajor]
   );
 
   const [rawItems, setRawItems] = useState<ScheduleItem[]>(() => {
@@ -389,7 +420,7 @@ export default function App() {
         cached &&
         Array.isArray(cached.items) &&
         cached.items.length > 0 &&
-        cached.metadata?.entityId === targetEntityId
+        (cached.metadata?.entityId === targetEntityId || cached.metadata?.authMode === 'raw_import')
       ) {
         return cached.items;
       }
@@ -405,7 +436,11 @@ export default function App() {
       const cached = JSON.parse(
         localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
       );
-      if (cached && cached.metadata && cached.metadata.entityId === targetEntityId) {
+      if (
+        cached &&
+        cached.metadata &&
+        (cached.metadata.entityId === targetEntityId || cached.metadata.authMode === 'raw_import')
+      ) {
         return cached.metadata;
       }
     } catch {
@@ -445,14 +480,6 @@ export default function App() {
     localStorage.setItem(STORAGE_OVERRIDES_KEY, JSON.stringify(overrides));
   }, [overrides]);
 
-  const metadataRef = useRef(metadata);
-  useEffect(() => {
-    metadataRef.current = metadata;
-  }, [metadata]);
-
-  const fetchRequestIdRef = useRef(0);
-  const lastExplicitFetchUrlRef = useRef<string | null>(null);
-
   // Fetch schedule from backend (/api/schedule) + automatic background updates (stable reference, no loop!)
   const fetchSchedule = useCallback(
     async (
@@ -463,21 +490,13 @@ export default function App() {
         password?: string;
         sessionCookie?: string;
         rawXmlOrHtml?: string;
+        major?: string;
       }
     ): Promise<{ ok: boolean; error?: string }> => {
-      const requestId = ++fetchRequestIdRef.current;
       const effectiveUrl = authPayload?.url || targetUrl;
-      const effectiveAuth = {
-        username: authPayload?.username || savedAuthRef.current.username,
-        password: authPayload?.password || savedAuthRef.current.password,
-        sessionCookie:
-          authPayload?.sessionCookie || savedAuthRef.current.sessionCookie,
-      };
+      const effectiveAuth = authPayload || savedAuthRef.current;
       const parsedTarget = parseUekUrl(effectiveUrl);
-
-      if (authPayload) {
-        lastExplicitFetchUrlRef.current = parsedTarget.cleanUrl;
-      }
+      const effectiveMajor = authPayload?.major || selectedMajorRef.current;
 
       // If raw XML/HTML/.ics/JSON was pasted, try client-side parsing immediately as a fast path
       if (
@@ -491,10 +510,10 @@ export default function App() {
           authPayload.username || 'Import bezpośredni'
         );
         if (directParsed && directParsed.items.length > 0) {
-          if (requestId === fetchRequestIdRef.current) {
-            setRawItems(directParsed.items);
-            setMetadata(directParsed.metadata);
-          }
+          setRawItems(directParsed.items);
+          setMetadata(directParsed.metadata);
+          setScheduleUrl(parsedTarget.cleanUrl);
+          localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
           try {
             localStorage.setItem(
               STORAGE_OFFLINE_CACHE_KEY,
@@ -517,6 +536,7 @@ export default function App() {
             password: effectiveAuth.password,
             sessionCookie: effectiveAuth.sessionCookie,
             rawXmlOrHtml: authPayload?.rawXmlOrHtml,
+            major: effectiveMajor,
           }),
         });
 
@@ -526,10 +546,6 @@ export default function App() {
         }
 
         const data = await response.json();
-        if (requestId !== fetchRequestIdRef.current) {
-          return { ok: true };
-        }
-
         if (!response.ok) {
           return {
             ok: false,
@@ -538,28 +554,30 @@ export default function App() {
         }
 
         if (data.items && data.metadata) {
-          // Never overwrite an already-loaded real schedule (cas_authenticated / cookie_session / raw_import)
-          // for the same entityId with a synthetic demo_preview during a background refresh
-          const currentMeta = metadataRef.current;
-          if (
-            !authPayload &&
-            data.metadata.authMode === 'demo_preview' &&
-            currentMeta.entityId === parsedTarget.entityId &&
-            currentMeta.authMode !== 'demo_preview'
-          ) {
-            return { ok: true };
-          }
+          // If user already has an authentic imported schedule ('raw_import'),
+          // and a routine background poll returns generic 'demo_preview',
+          // NEVER overwrite the user's authentic schedule!
+          setMetadata((prevMeta) => {
+            if (
+              !authPayload?.rawXmlOrHtml &&
+              !authPayload?.url &&
+              prevMeta.authMode === 'raw_import' &&
+              data.metadata.authMode === 'demo_preview'
+            ) {
+              return prevMeta;
+            }
+            setRawItems(data.items);
+            try {
+              localStorage.setItem(
+                STORAGE_OFFLINE_CACHE_KEY,
+                JSON.stringify({ items: data.items, metadata: data.metadata })
+              );
+            } catch {
+              // ignore storage quota errors
+            }
+            return data.metadata;
+          });
 
-          setRawItems(data.items);
-          setMetadata(data.metadata);
-          try {
-            localStorage.setItem(
-              STORAGE_OFFLINE_CACHE_KEY,
-              JSON.stringify({ items: data.items, metadata: data.metadata })
-            );
-          } catch {
-            // ignore storage quota errors
-          }
           if (data.sessionCookie) {
             setSavedAuth((prev) => {
               if (prev.sessionCookie === data.sessionCookie) return prev;
@@ -572,11 +590,7 @@ export default function App() {
         }
         return { ok: false, error: 'Pusta odpowiedź serwera.' };
       } catch {
-        if (requestId !== fetchRequestIdRef.current) {
-          return { ok: true };
-        }
-
-        // Offline or static-host mode: only use cached schedule if it belongs to the SAME group entityId!
+        // Offline or static-host mode: only use cached schedule if it belongs to the SAME group entityId or is a raw import!
         try {
           const cached = JSON.parse(
             localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
@@ -585,7 +599,7 @@ export default function App() {
             cached &&
             Array.isArray(cached.items) &&
             cached.items.length > 0 &&
-            cached.metadata?.entityId === parsedTarget.entityId
+            (cached.metadata?.entityId === parsedTarget.entityId || cached.metadata?.authMode === 'raw_import')
           ) {
             setRawItems(cached.items);
             setMetadata(cached.metadata);
@@ -595,7 +609,13 @@ export default function App() {
           // ignore
         }
 
-        const fallback = generateRealisticUekSchedule(effectiveUrl);
+        const fallback = generateRealisticUekSchedule(
+          effectiveUrl,
+          undefined,
+          'demo_preview',
+          undefined,
+          effectiveMajor
+        );
         setRawItems(fallback.items);
         setMetadata(fallback.metadata);
         try {
@@ -616,11 +636,6 @@ export default function App() {
   );
 
   useEffect(() => {
-    const cleanTarget = parseUekUrl(scheduleUrl).cleanUrl;
-    if (lastExplicitFetchUrlRef.current === cleanTarget) {
-      lastExplicitFetchUrlRef.current = null;
-      return;
-    }
     fetchSchedule(scheduleUrl);
   }, [scheduleUrl, fetchSchedule]);
 
@@ -735,17 +750,12 @@ export default function App() {
           dates: [d],
         });
       } else {
-        const firstDt = new Date(`${last.dates[0]}T12:00:00`);
         const prevDt = new Date(`${last.dates[last.dates.length - 1]}T12:00:00`);
         const currDt = new Date(`${d}T12:00:00`);
         const diffDays = Math.round(
           (currDt.getTime() - prevDt.getTime()) / (1000 * 60 * 60 * 24)
         );
-        const spanFromFirst = Math.round(
-          (currDt.getTime() - firstDt.getTime()) / (1000 * 60 * 60 * 24)
-        );
-        // Group consecutive weekend days (Fri-Sat-Sun) without merging across Sunday into the next week
-        if (diffDays <= 2 && spanFromFirst <= 2 && prevDt.getDay() !== 0) {
+        if (diffDays <= 4) {
           last.dates.push(d);
         } else {
           clusters.push({
@@ -774,25 +784,16 @@ export default function App() {
 
   // Selected Zjazd ID (defaults to 'z5' = 6–8 LIS)
   const [selectedZjazdId, setSelectedZjazdId] = useState<string>('z5');
-  const prevEntityIdRef = useRef<string>(metadata.entityId);
 
   useEffect(() => {
-    if (zjazdyGroups.length === 0) return;
-
-    const entityChanged = prevEntityIdRef.current !== metadata.entityId;
-    prevEntityIdRef.current = metadata.entityId;
-
-    const currentExists = zjazdyGroups.some((z) => z.id === selectedZjazdId);
-    if (!currentExists || entityChanged) {
-      const currentOrUpcoming =
-        zjazdyGroups.find(
-          (z) => z.dates[z.dates.length - 1] >= warsawClock.dateStr
-        ) || zjazdyGroups[zjazdyGroups.length - 1];
-      if (currentOrUpcoming) {
-        setSelectedZjazdId(currentOrUpcoming.id);
-      }
+    if (
+      zjazdyGroups.length > 0 &&
+      !zjazdyGroups.some((z) => z.id === selectedZjazdId)
+    ) {
+      const novZjazd = zjazdyGroups.find((z) => z.dates.includes('2026-11-06'));
+      setSelectedZjazdId(novZjazd ? novZjazd.id : zjazdyGroups[0].id);
     }
-  }, [zjazdyGroups, selectedZjazdId, metadata.entityId, warsawClock.dateStr]);
+  }, [zjazdyGroups, selectedZjazdId]);
 
   const activeZjazd = useMemo(() => {
     return (
@@ -1950,23 +1951,11 @@ export default function App() {
                 (i) => i.status === 'cancelled' || isItemCompleted(i)
               );
 
-            // Check if there is at least one day in this Zjazd that still has ongoing/upcoming classes
-            const hasUnfinishedDayInZjazd = zjazdDates.some((dStr) => {
-              const dItems = itemsByDate[dStr] || [];
-              return (
-                dItems.length > 0 &&
-                dItems.some((i) => i.status !== 'cancelled' && !isItemCompleted(i))
-              );
-            });
-
-            // Auto-collapse completed days ONLY when there is still an active/unfinished day in the same Zjazd,
-            // so selecting a finished Zjazd (or viewing Sunday evening) never leaves all days collapsed!
+            // Auto-collapse completed days unless user explicitly toggled this date!
             const isCollapsed =
               userCollapsedOverrides[dateStr] !== undefined
                 ? userCollapsedOverrides[dateStr]
-                : layoutPrefs.autoCollapseCompletedDays &&
-                  isDayCompleted &&
-                  hasUnfinishedDayInZjazd;
+                : layoutPrefs.autoCollapseCompletedDays && isDayCompleted;
 
             const handleToggleDay = () => {
               setUserCollapsedOverrides((prev) => ({
@@ -2646,6 +2635,28 @@ export default function App() {
           setScheduleUrl(newUrl);
           localStorage.setItem(STORAGE_URL_KEY, newUrl);
         }}
+        selectedMajor={selectedMajor}
+        onSelectMajor={(major) => {
+          setSelectedMajor(major);
+          localStorage.setItem(STORAGE_MAJOR_KEY, major);
+          const updatedFallback = generateRealisticUekSchedule(
+            scheduleUrl,
+            undefined,
+            'demo_preview',
+            undefined,
+            major
+          );
+          setRawItems(updatedFallback.items);
+          setMetadata(updatedFallback.metadata);
+          try {
+            localStorage.setItem(
+              STORAGE_OFFLINE_CACHE_KEY,
+              JSON.stringify(updatedFallback)
+            );
+          } catch {
+            // ignore
+          }
+        }}
         languageUrl={languageUrl}
         customLangRoom={customLangMeta.room || ''}
         customLangLecturer={customLangMeta.lecturer || ''}
@@ -2666,31 +2677,48 @@ export default function App() {
         authMode={metadata.authMode}
         casUser={metadata.casUser}
         onLoginSubmit={async (payload) => {
-          if (
-            payload.rememberForAutoSync &&
-            (payload.username || payload.sessionCookie)
-          ) {
-            setSavedAuth((prev) => {
-              const toStore = {
-                username: payload.username || prev.username,
-                sessionCookie: payload.sessionCookie || prev.sessionCookie,
-              };
-              localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(toStore));
-              return toStore;
-            });
+          if (payload.rememberForAutoSync) {
+            // Bezpieczeństwo: NIGDY nie zapisujemy hasła otwartym tekstem w localStorage!
+            // Zapisujemy tylko identyfikator lub ciasteczko sesji.
+            const toStore = {
+              username: payload.username,
+              sessionCookie: payload.sessionCookie,
+            };
+            setSavedAuth(toStore);
+            localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(toStore));
+          }
+          if (payload.major) {
+            setSelectedMajor(payload.major);
+            localStorage.setItem(STORAGE_MAJOR_KEY, payload.major);
           }
           return fetchSchedule(payload.url || scheduleUrl, payload);
         }}
         onResetToDefaultSchedule={() => {
+          setSelectedMajor('informatyka');
+          localStorage.setItem(STORAGE_MAJOR_KEY, 'informatyka');
           setScheduleUrl(DEFAULT_UEK_URL);
           localStorage.setItem(STORAGE_URL_KEY, DEFAULT_UEK_URL);
           setLanguageUrl(DEFAULT_LANGUAGE_UEK_URL);
           localStorage.setItem(STORAGE_LANG_URL_KEY, DEFAULT_LANGUAGE_UEK_URL);
           setCustomLangMeta({});
           localStorage.removeItem(STORAGE_LANG_META_KEY);
-          const def = generateRealisticUekSchedule(DEFAULT_UEK_URL);
+          const def = generateRealisticUekSchedule(
+            DEFAULT_UEK_URL,
+            undefined,
+            'demo_preview',
+            undefined,
+            'informatyka'
+          );
           setRawItems(def.items);
           setMetadata(def.metadata);
+          try {
+            localStorage.setItem(
+              STORAGE_OFFLINE_CACHE_KEY,
+              JSON.stringify(def)
+            );
+          } catch {
+            // ignore
+          }
         }}
       />
 

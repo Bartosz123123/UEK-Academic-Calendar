@@ -7,6 +7,46 @@
         try {
           if (typeof window !== 'undefined') {
             var w = window;
+            var origConsoleError = console.error;
+            console.error = function () {
+              var args = Array.prototype.slice.call(arguments);
+              var joined = args
+                .map(function (a) {
+                  return String(a && a.stack ? a.stack : a && a.message ? a.message : a);
+                })
+                .join(' ');
+              if (
+                joined.indexOf('WebSocket closed without opened') !== -1 ||
+                joined.indexOf('@vite/client') !== -1 ||
+                joined.indexOf("reading 'onMessage'") !== -1
+              ) {
+                return;
+              }
+              return origConsoleError.apply(console, arguments);
+            };
+
+            if (w.WebSocket) {
+              var OrigWS = w.WebSocket;
+              var PatchedWS = function (url, protocols) {
+                var ws = protocols !== undefined ? new OrigWS(url, protocols) : new OrigWS(url);
+                ws.addEventListener(
+                  'error',
+                  function (e) {
+                    if (e && e.stopImmediatePropagation) e.stopImmediatePropagation();
+                    if (e && e.preventDefault) e.preventDefault();
+                  },
+                  true
+                );
+                return ws;
+              };
+              PatchedWS.prototype = OrigWS.prototype;
+              PatchedWS.CONNECTING = OrigWS.CONNECTING;
+              PatchedWS.OPEN = OrigWS.OPEN;
+              PatchedWS.CLOSING = OrigWS.CLOSING;
+              PatchedWS.CLOSED = OrigWS.CLOSED;
+              w.WebSocket = PatchedWS;
+            }
+
             if (!w.chrome) w.chrome = {};
             if (!w.chrome.runtime) {
               w.chrome.runtime = {
@@ -30,7 +70,9 @@
                 s.indexOf('moz-extension://') !== -1 ||
                 st.indexOf('chrome-extension://') !== -1 ||
                 m.indexOf("reading 'onMessage'") !== -1 ||
-                m.indexOf('WebSocket closed without opened') !== -1
+                m.indexOf('WebSocket closed without opened') !== -1 ||
+                st.indexOf('@vite/client') !== -1 ||
+                s.indexOf('@vite/client') !== -1
               );
             };
             w.addEventListener(

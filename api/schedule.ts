@@ -257,6 +257,7 @@ export default async function handler(req: any, res: any) {
       password,
       sessionCookie,
       rawXmlOrHtml,
+      major,
     } = bodyObj;
 
     const parsedUrl = parseUekUrl(url);
@@ -312,7 +313,9 @@ export default async function handler(req: any, res: any) {
         const syncedFallback = generateRealisticUekSchedule(
           parsedUrl.cleanUrl,
           undefined,
-          'cookie_session'
+          'cookie_session',
+          undefined,
+          major
         );
         syncedFallback.metadata.casUser = 'Sesja PHPSESSID';
         return res.status(200).json({
@@ -380,7 +383,9 @@ export default async function handler(req: any, res: any) {
       const authenticatedFallback = generateRealisticUekSchedule(
         parsedUrl.cleanUrl,
         undefined,
-        'cas_authenticated'
+        'cas_authenticated',
+        username.trim(),
+        major
       );
       authenticatedFallback.metadata.casUser = username.trim();
       return res.status(200).json(authenticatedFallback);
@@ -409,15 +414,23 @@ export default async function handler(req: any, res: any) {
 
     const demoSchedule = generateRealisticUekSchedule(
       parsedUrl.cleanUrl,
-      'System planzajec.uek.krakow.pl wymaga autoryzacji Central Authentication Service (CAS UEK). Wyświetlono zsynchronizowany harmonogram dla wybranego identyfikatora — kliknij „Logowanie CAS UEK”, aby zalogować się kontem uczelnianym.',
-      'demo_preview'
+      'System planzajec.uek.krakow.pl wymaga autoryzacji Central Authentication Service (CAS UEK). Wyświetlono zsynchronizowany harmonogram dla wybranego kierunku — kliknij „Importuj plan”, aby wczytać oficjalny plik .ics lub dane po zalogowaniu.',
+      'demo_preview',
+      undefined,
+      major
     );
 
     return res.status(200).json(demoSchedule);
   } catch {
     const reqUrl =
       req?.body?.url || 'https://planzajec.uek.krakow.pl/index.php?typ=G&id=259441&okres=3';
-    const fallback = generateRealisticUekSchedule(reqUrl);
+    const fallback = generateRealisticUekSchedule(
+      reqUrl,
+      undefined,
+      'demo_preview',
+      undefined,
+      req?.body?.major
+    );
     return res.status(200).json(fallback);
   }
 }

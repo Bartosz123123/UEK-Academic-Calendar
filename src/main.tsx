@@ -8,8 +8,22 @@ if (typeof window !== 'undefined') {
   };
   const origError = console.error;
   console.error = (...args: unknown[]) => {
+    const msg = args
+      .map((a: unknown) => {
+        const err = a as { stack?: string; message?: string } | null;
+        return String(err?.stack || err?.message || a);
+      })
+      .join(' ');
+
+    if (
+      msg.includes('WebSocket closed without opened') ||
+      msg.includes('@vite/client') ||
+      msg.includes("reading 'onMessage'")
+    ) {
+      return;
+    }
+
     origError.apply(console, args);
-    const msg = args.map((a) => String(a)).join(' ');
     if (
       msg.includes('OverQuotaMapError') ||
       msg.includes('QuotaExceededError')
