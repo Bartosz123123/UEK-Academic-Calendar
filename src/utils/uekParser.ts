@@ -138,6 +138,28 @@ export function extractCleanTypeAndNotes(
     noteParts.push(rawNotes.trim());
   }
 
+  // Extract parenthetical reschedule/cancellation notes e.g. "(na 22.11)", "(z 8.11)", "(przeniesione...)" from Type
+  const parenNoteRegex =
+    /\(\s*(?:uwagi\s*:?\s*)?((?:z|na)\s*\d{1,2}[.,]\d{1,2}[^)]*|przeniesion[^)]*|przełożon[^)]*|odwołan[^)]*|odrabian[^)]*|zmiana\s+terminu[^)]*)\s*\)/gi;
+
+  let mParen: RegExpExecArray | null;
+  while ((mParen = parenNoteRegex.exec(cleanType)) !== null) {
+    noteParts.push(mParen[1].trim());
+  }
+  cleanType = cleanType.replace(parenNoteRegex, '').trim() || 'Wykład';
+
+  // Extract parenthetical reschedule/cancellation notes from Subject (keep in subject or clean, and add to notes)
+  parenNoteRegex.lastIndex = 0;
+  while ((mParen = parenNoteRegex.exec(cleanSubject)) !== null) {
+    noteParts.push(mParen[1].trim());
+  }
+
+  // Extract parenthetical reschedule/cancellation notes from Room
+  parenNoteRegex.lastIndex = 0;
+  while ((mParen = parenNoteRegex.exec(rawRoom || '')) !== null) {
+    noteParts.push(mParen[1].trim());
+  }
+
   // Check if rawType has embedded "Uwagi: ..." or newline-separated note (from <br> in UEK HTML table)
   const typeUwagiMatch = cleanType.match(/^(.*?)\b(uwagi\s*:?\s*[\s\S]+)$/i);
   if (typeUwagiMatch) {

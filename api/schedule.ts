@@ -196,6 +196,25 @@ function extractCleanTypeAndNotes(
     noteParts.push(rawNotes.trim());
   }
 
+  const parenNoteRegex =
+    /\(\s*(?:uwagi\s*:?\s*)?((?:z|na)\s*\d{1,2}[.,]\d{1,2}[^)]*|przeniesion[^)]*|przełożon[^)]*|odwołan[^)]*|odrabian[^)]*|zmiana\s+terminu[^)]*)\s*\)/gi;
+
+  let mParen: RegExpExecArray | null;
+  while ((mParen = parenNoteRegex.exec(cleanType)) !== null) {
+    noteParts.push(mParen[1].trim());
+  }
+  cleanType = cleanType.replace(parenNoteRegex, '').trim() || 'Wykład';
+
+  parenNoteRegex.lastIndex = 0;
+  while ((mParen = parenNoteRegex.exec(cleanSubject)) !== null) {
+    noteParts.push(mParen[1].trim());
+  }
+
+  parenNoteRegex.lastIndex = 0;
+  while ((mParen = parenNoteRegex.exec(rawRoom || '')) !== null) {
+    noteParts.push(mParen[1].trim());
+  }
+
   const typeUwagiMatch = cleanType.match(/^(.*?)\b(uwagi\s*:?\s*[\s\S]+)$/i);
   if (typeUwagiMatch) {
     cleanType = typeUwagiMatch[1].trim() || 'Wykład';

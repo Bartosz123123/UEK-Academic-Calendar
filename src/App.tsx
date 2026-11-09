@@ -6,7 +6,9 @@ import {
   MapPin,
   Moon,
   Palette,
+  Sparkles,
   Sun,
+  X,
 } from 'lucide-react';
 import {
   CustomColorsConfig,
@@ -54,6 +56,57 @@ const STORAGE_COLORS_KEY = 'uek_apple_schedule_colors_v2';
 const STORAGE_LAYOUT_PREFS_KEY = 'uek_apple_schedule_layout_v1';
 const STORAGE_THEME_MODE_KEY = 'uek_apple_schedule_dark_v2';
 const STORAGE_OFFLINE_CACHE_KEY = 'uek_apple_schedule_offline_cache_v2';
+const STORAGE_SEEN_VERSION_KEY = 'uek_apple_schedule_seen_version_v1';
+const CURRENT_APP_VERSION = '2.5.0';
+
+function getRescheduleExplanation(rawNoteStr?: string): {
+  badgeText: string;
+  headline: string;
+  subtext: string;
+} {
+  const note = (rawNoteStr || '').trim();
+  const clean = note.replace(/^uwagi\s*:?\s*/i, '').trim();
+
+  const movedToMatch = clean.match(/\bna\s+(\d{1,2}[.,]\d{1,2}(?:[.,]\d{2,4})?)/i);
+  const movedFromMatch = clean.match(/\bz\s+(\d{1,2}[.,]\d{1,2}(?:[.,]\d{2,4})?)/i);
+
+  if (movedToMatch && !movedFromMatch) {
+    const targetDate = movedToMatch[1];
+    return {
+      badgeText: `Przeniesione (na ${targetDate})`,
+      headline: note.toLowerCase().startsWith('uwagi') ? note : `Uwagi: ${clean}`,
+      subtext: `Ten termin został przełożony na dzień ${targetDate} — zajęcia z tego okienka odbywają się w nowym terminie.`,
+    };
+  }
+
+  if (movedFromMatch && !movedToMatch) {
+    const sourceDate = movedFromMatch[1];
+    return {
+      badgeText: `Przeniesione (z ${sourceDate})`,
+      headline: note.toLowerCase().startsWith('uwagi') ? note : `Uwagi: ${clean}`,
+      subtext: `Dodatkowe zajęcia odrabiane z dnia ${sourceDate} (dlatego mogą mieć inną salę lub formę Online).`,
+    };
+  }
+
+  if (movedFromMatch && movedToMatch) {
+    return {
+      badgeText: `Przeniesione (${movedFromMatch[1]} → ${movedToMatch[1]})`,
+      headline: note.toLowerCase().startsWith('uwagi') ? note : `Uwagi: ${clean}`,
+      subtext: `Zajęcia przeniesione z dnia ${movedFromMatch[1]} na ${movedToMatch[1]}.`,
+    };
+  }
+
+  return {
+    badgeText: 'Zajęcia przeniesione',
+    headline:
+      note.length > 0
+        ? note.toLowerCase().startsWith('uwagi')
+          ? note
+          : `Uwagi: ${clean}`
+        : 'Uwagi: zmiana terminu zajęć',
+    subtext: 'Zmiana terminu lub trybu zajęć w harmonogramie UEK.',
+  };
+}
 
 const POLISH_MONTHS_GENITIVE = [
   'stycznia',
@@ -888,6 +941,22 @@ export default function App() {
   // Modals state
   const [isImportModalOpen, setIsImportModalOpen] = useState<boolean>(false);
   const [isColorsModalOpen, setIsColorsModalOpen] = useState<boolean>(false);
+  const [isWhatsNewOpen, setIsWhatsNewOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(STORAGE_SEEN_VERSION_KEY) !== CURRENT_APP_VERSION;
+    } catch {
+      return false;
+    }
+  });
+
+  const handleDismissWhatsNew = useCallback(() => {
+    setIsWhatsNewOpen(false);
+    try {
+      localStorage.setItem(STORAGE_SEEN_VERSION_KEY, CURRENT_APP_VERSION);
+    } catch {
+      // ignore
+    }
+  }, []);
   const [inspectedItem, setInspectedItem] = useState<ScheduleItem | null>(null);
   const [campusMapRoom, setCampusMapRoom] = useState<{
     room: string;
@@ -1314,6 +1383,21 @@ export default function App() {
               isDark={isDark}
               accentColor={customColors.accentColor}
             />
+
+            {/* What's New / Changelog button */}
+            <button
+              type="button"
+              onClick={() => setIsWhatsNewOpen(true)}
+              aria-label="Co nowego w aplikacji"
+              title="Co nowego w aktualizacji"
+              className={`w-9 h-9 sm:w-10 sm:h-10 rounded-full flex items-center justify-center border transition-colors ${
+                isDark
+                  ? 'bg-white/6 hover:bg-white/12 border-white/12 text-sky-300'
+                  : 'bg-white/90 hover:bg-white border-slate-200/90 shadow-xs text-sky-600'
+              }`}
+            >
+              <Sparkles className="w-4 h-4" />
+            </button>
 
             {/* Palette button -> opens "Studio Personalizacji Planu" */}
             <button
@@ -2191,6 +2275,12 @@ export default function App() {
                         item.status === 'rescheduled' ||
                         Boolean(item.rawNotes) ||
                         Boolean(item.statusReason);
+                      const rescheduleDetails =
+                        hasRescheduleNote && !isCancelled
+                          ? getRescheduleExplanation(
+                              item.statusReason || item.rawNotes
+                            )
+                          : null;
 
                       return (
                         <React.Fragment key={item.id}>
@@ -2268,7 +2358,15 @@ export default function App() {
                             className={`${rowDensityClass} transition-all cursor-pointer relative ${
                               isLiveCard
                                 ? 'm-2 rounded-[22px] border-2'
-                                : completed && !isCancelled
+                                : isCancelled
+                                ? isDark
+                                  ? 'm-2 rounded-[20px] border border-rose-500/50 bg-rose-500/[0.06] hover:bg-rose-500/[0.10]'
+                                  : 'm-2 rounded-[20px] border border-rose-400/60 bg-rose-50/70 hover:bg-rose-50'
+                                : hasRescheduleNote
+                                ? isDark
+                                  ? 'm-2 rounded-[20px] border-2 border-amber-500/80 bg-amber-500/[0.08] shadow-[0_0_20px_rgba(245,158,11,0.16)] hover:bg-amber-500/[0.12]'
+                                  : 'm-2 rounded-[20px] border-2 border-amber-500/85 bg-amber-50/85 shadow-[0_4px_16px_rgba(245,158,11,0.14)] hover:bg-amber-100/70'
+                                : completed
                                 ? isDark
                                   ? 'm-2 rounded-[20px] border border-emerald-400/40 bg-emerald-500/[0.05] shadow-[0_0_14px_rgba(52,211,153,0.07)] hover:bg-emerald-500/[0.08]'
                                   : 'm-2 rounded-[20px] border border-emerald-500/45 bg-emerald-50/60 shadow-[0_2px_10px_rgba(16,185,129,0.06)] hover:bg-emerald-50/85'
@@ -2284,6 +2382,10 @@ export default function App() {
                                   className={`text-sm font-bold leading-tight ${
                                     isCancelled
                                       ? 'line-through opacity-50'
+                                      : hasRescheduleNote
+                                      ? isDark
+                                        ? 'text-amber-300'
+                                        : 'text-amber-700'
                                       : completed
                                       ? isDark
                                         ? 'text-slate-400'
@@ -2302,7 +2404,12 @@ export default function App() {
                                 </p>
                                 {layoutPrefs.showClassDuration && (
                                   <p
-                                    style={{ color: catStyle.barColor }}
+                                    style={{
+                                      color:
+                                        hasRescheduleNote && !isCancelled
+                                          ? '#F59E0B'
+                                          : catStyle.barColor,
+                                    }}
                                     className="text-[10px] font-semibold mt-0.5 opacity-85"
                                   >
                                     {getClassDurationLabel(
@@ -2318,16 +2425,25 @@ export default function App() {
                                 <div className="flex flex-col items-center pt-1.5 shrink-0">
                                   <span
                                     style={{
-                                      backgroundColor: catStyle.barColor,
-                                      boxShadow: completed
-                                        ? undefined
-                                        : `0 0 8px ${catStyle.barColor}85`,
+                                      backgroundColor:
+                                        hasRescheduleNote && !isCancelled
+                                          ? '#F59E0B'
+                                          : catStyle.barColor,
+                                      boxShadow:
+                                        hasRescheduleNote && !isCancelled
+                                          ? '0 0 8px #F59E0B95'
+                                          : completed
+                                          ? undefined
+                                          : `0 0 8px ${catStyle.barColor}85`,
                                     }}
                                     className="w-2.5 h-2.5 rounded-full"
                                   />
                                   <span
                                     style={{
-                                      backgroundColor: `${catStyle.barColor}28`,
+                                      backgroundColor:
+                                        hasRescheduleNote && !isCancelled
+                                          ? '#F59E0B40'
+                                          : `${catStyle.barColor}28`,
                                     }}
                                     className="w-0.5 flex-1 rounded-full mt-1.5"
                                   />
@@ -2335,10 +2451,15 @@ export default function App() {
                               ) : (
                                 <div
                                   style={{
-                                    backgroundColor: catStyle.barColor,
+                                    backgroundColor:
+                                      hasRescheduleNote && !isCancelled
+                                        ? '#F59E0B'
+                                        : catStyle.barColor,
                                     boxShadow:
-                                      layoutPrefs.categoryIndicator ===
-                                        'glow_bar' && !completed
+                                      hasRescheduleNote && !isCancelled
+                                        ? '0 0 10px #F59E0B95'
+                                        : layoutPrefs.categoryIndicator ===
+                                            'glow_bar' && !completed
                                         ? `0 0 10px ${catStyle.barColor}90`
                                         : undefined,
                                   }}
@@ -2352,7 +2473,7 @@ export default function App() {
                                   className={`text-[15px] sm:text-base font-bold leading-snug ${
                                     isCancelled
                                       ? 'line-through text-slate-400'
-                                      : completed
+                                      : completed && !hasRescheduleNote
                                       ? isDark
                                         ? 'text-slate-300'
                                         : 'text-slate-600'
@@ -2438,17 +2559,32 @@ export default function App() {
                                     )}
                                 </div>
 
-                                {/* Rescheduled / Uwagi Line ("Uwagi: na 25.10" / "Uwagi: na 8.11") */}
-                                {hasRescheduleNote && !isCancelled && (
-                                  <p
-                                    style={{
-                                      color: adaptiveRescheduledText,
-                                    }}
-                                    className="mt-1 text-xs font-bold"
-                                  >
-                                    {item.statusReason || item.rawNotes}
-                                  </p>
-                                )}
+                                {/* Rescheduled / Uwagi Orange Box ("Uwagi: na 25.10" / "Uwagi: z 8.11") */}
+                                {hasRescheduleNote &&
+                                  !isCancelled &&
+                                  rescheduleDetails && (
+                                    <div
+                                      className={`mt-2 px-3 py-2 rounded-xl border text-xs ${
+                                        isDark
+                                          ? 'bg-amber-500/15 border-amber-400/35 text-amber-200'
+                                          : 'bg-amber-500/12 border-amber-500/35 text-amber-950'
+                                      }`}
+                                    >
+                                      <div className="font-bold flex items-center gap-1.5">
+                                        <span className="text-amber-400">⇄</span>
+                                        <span>{rescheduleDetails.headline}</span>
+                                      </div>
+                                      <p
+                                        className={`text-[11px] mt-0.5 leading-snug ${
+                                          isDark
+                                            ? 'text-amber-200/85'
+                                            : 'text-amber-900/85'
+                                        }`}
+                                      >
+                                        {rescheduleDetails.subtext}
+                                      </p>
+                                    </div>
+                                  )}
 
                                 {isCancelled && (
                                   <p className="mt-1 text-xs font-bold text-rose-500">
@@ -2456,7 +2592,7 @@ export default function App() {
                                   </p>
                                 )}
 
-                                {/* Counter Badge, Completed ("✓ Odbyte") Badge, & Live Status Pill */}
+                                {/* Counter Badge, Rescheduled Badge, Completed ("✓ Odbyte") Badge, & Live Status Pill */}
                                 <div className="mt-2.5 flex flex-wrap items-center gap-2">
                                   {layoutPrefs.showClassCounters &&
                                     item.counterLabel && (
@@ -2469,6 +2605,21 @@ export default function App() {
                                         className="px-2.5 py-0.5 rounded-full text-[11px] font-semibold border tabular-nums"
                                       >
                                         {item.counterLabel}
+                                      </span>
+                                    )}
+
+                                  {hasRescheduleNote &&
+                                    !isCancelled &&
+                                    rescheduleDetails && (
+                                      <span
+                                        className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
+                                          isDark
+                                            ? 'bg-amber-500/20 border-amber-400/50 text-amber-300'
+                                            : 'bg-amber-100 border-amber-500/50 text-amber-900'
+                                        }`}
+                                      >
+                                        <span>⇄</span>
+                                        <span>{rescheduleDetails.badgeText}</span>
                                       </span>
                                     )}
 
@@ -2829,6 +2980,164 @@ export default function App() {
         isDark={isDark}
         accentColor={customColors.accentColor}
       />
+
+      {/* Modal 5: Jednorazowy popup "Co nowego w aktualizacji" w stylu Apple */}
+      {isWhatsNewOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/65 backdrop-blur-xl animate-in fade-in duration-200"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="whats-new-title"
+          onClick={handleDismissWhatsNew}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className={`w-full max-w-[460px] rounded-[32px] p-6 sm:p-7 border shadow-2xl transition-colors ${
+              isDark
+                ? 'bg-[#161922]/95 border-white/15 text-[#F5F5F7]'
+                : 'bg-white/95 border-slate-200/90 text-[#1D1D1F]'
+            }`}
+          >
+            {/* Top Apple Badge & Close */}
+            <div className="flex items-start justify-between gap-3">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-[11px] font-bold tracking-wide uppercase bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Aktualizacja · Wersja {CURRENT_APP_VERSION}</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleDismissWhatsNew}
+                aria-label="Zamknij"
+                className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${
+                  isDark
+                    ? 'bg-white/10 hover:bg-white/20 text-slate-300'
+                    : 'bg-slate-100 hover:bg-slate-200 text-slate-600'
+                }`}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Title */}
+            <h2
+              id="whats-new-title"
+              className="mt-3.5 text-xl sm:text-2xl font-bold tracking-tight"
+            >
+              Co nowego w Plan UEK
+            </h2>
+            <p
+              className={`mt-1 text-xs sm:text-sm ${
+                isDark ? 'text-slate-400' : 'text-slate-600'
+              }`}
+            >
+              Najważniejsze zmiany wprowadzone w najnowszej wersji aplikacji:
+            </p>
+
+            {/* Changelog Items */}
+            <div className="mt-5 space-y-3.5 text-xs sm:text-[13px]">
+              {/* Item 1: Orange border for rescheduled */}
+              <div
+                className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
+                  isDark
+                    ? 'bg-amber-500/10 border-amber-500/35'
+                    : 'bg-amber-50/90 border-amber-300/80'
+                }`}
+              >
+                <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase tracking-wider bg-amber-500 text-black shrink-0 mt-0.5">
+                  Dodano
+                </span>
+                <div>
+                  <p className="font-bold">
+                    Pomarańczowa obramówka dla przeniesionych zajęć
+                  </p>
+                  <p
+                    className={`mt-0.5 text-[11px] leading-relaxed ${
+                      isDark ? 'text-slate-300' : 'text-slate-600'
+                    }`}
+                  >
+                    Zajęcia z dopiskiem np. <strong>(na 22.11)</strong> lub{' '}
+                    <strong>(z 8.11)</strong> mają teraz wyraźną pomarańczową
+                    ramkę i czytelny opis wyjaśniający, dlaczego w danym dniu
+                    widnieją dwa terminy lub inna sala / forma Online.
+                  </p>
+                </div>
+              </div>
+
+              {/* Item 2: Link & CAS fix */}
+              <div
+                className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
+                  isDark
+                    ? 'bg-emerald-500/10 border-emerald-500/30'
+                    : 'bg-emerald-50/80 border-emerald-300/70'
+                }`}
+              >
+                <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase tracking-wider bg-emerald-500 text-black shrink-0 mt-0.5">
+                  Naprawiono
+                </span>
+                <div>
+                  <p className="font-bold">
+                    Wczytywanie linków grup i uwag z tabeli UEK
+                  </p>
+                  <p
+                    className={`mt-0.5 text-[11px] leading-relaxed ${
+                      isDark ? 'text-slate-300' : 'text-slate-600'
+                    }`}
+                  >
+                    Wklejenie dowolnego linku grupy z{' '}
+                    <code>planzajec.uek.krakow.pl</code> od razu podmienia plan,
+                    poprawnie odczytuje uwagi z kolumny <em>Forma</em> i nie
+                    ukrywa zakończonych zjazdów.
+                  </p>
+                </div>
+              </div>
+
+              {/* Item 3: Removed manual major picker */}
+              <div
+                className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
+                  isDark
+                    ? 'bg-white/[0.04] border-white/10'
+                    : 'bg-slate-100/80 border-slate-200'
+                }`}
+              >
+                <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase tracking-wider bg-rose-500/90 text-white shrink-0 mt-0.5">
+                  Usunięto
+                </span>
+                <div>
+                  <p className="font-bold">
+                    Ręczny wybór kierunku studiów w oknie importu
+                  </p>
+                  <p
+                    className={`mt-0.5 text-[11px] leading-relaxed ${
+                      isDark ? 'text-slate-400' : 'text-slate-600'
+                    }`}
+                  >
+                    Usunięto zbędny przełącznik kierunków — aplikacja
+                    automatycznie pobiera i dopasowuje dane na podstawie samego
+                    linku grupy.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Primary CTA Button */}
+            <button
+              type="button"
+              onClick={handleDismissWhatsNew}
+              style={{
+                background: `linear-gradient(180deg, ${mixHexColors(
+                  customColors.accentColor,
+                  '#FFFFFF',
+                  0.1
+                )} 0%, ${customColors.accentColor} 100%)`,
+                boxShadow: `inset 0 1px 0 rgba(255,255,255,0.28), 0 6px 20px ${customColors.accentColor}45`,
+              }}
+              className="mt-6 w-full h-[48px] rounded-2xl font-bold text-sm text-white hover:opacity-95 transition-opacity"
+            >
+              Rozumiem, przejdź do planu
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Non-intrusive offline mode indicator */}
       <OfflineIndicator />
