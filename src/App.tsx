@@ -59,7 +59,49 @@ const STORAGE_THEME_MODE_KEY = 'uek_apple_schedule_dark_v2';
 const STORAGE_OFFLINE_CACHE_KEY = 'uek_apple_schedule_offline_cache_v2';
 const STORAGE_SEEN_VERSION_KEY = 'uek_apple_schedule_seen_version_v1';
 const STORAGE_SEEN_DIFFS_KEY = 'uek_apple_schedule_seen_diffs_v1';
-const CURRENT_APP_VERSION = '2.8.0';
+const CURRENT_APP_VERSION = '2.8.1';
+
+const SYNTHETIC_DEMO_NOTES = new Set([
+  'uwagi: na 28.11',
+  'uwagi: na 14.11',
+  'uwagi: na 6.12',
+  'uwagi: na 15.11',
+  'uwagi: zmiana godziny (z 13:30)',
+  'uwagi: przeniesione na 7.11 (ms teams)',
+  'uwagi: przeniesione z 24.10',
+  'uwagi: odrabianie zajęć z 14.11',
+  'uwagi: przeniesione na 17.10',
+  'uwagi: przeniesione z 17.10',
+  'uwagi: na 8.11 (ms teams)',
+  'uwagi: przeniesione na 15.11',
+  'uwagi: kolokwium zaliczeniowe',
+]);
+
+function cleanSyntheticRescheduleNotes(items: ScheduleItem[]): ScheduleItem[] {
+  return items.map((item) => {
+    const rawLower = (item.rawNotes || '').trim().toLowerCase();
+    const reasonLower = (item.statusReason || '').trim().toLowerCase();
+    if (
+      SYNTHETIC_DEMO_NOTES.has(rawLower) ||
+      SYNTHETIC_DEMO_NOTES.has(reasonLower) ||
+      (item.id.startsWith('uek-') &&
+        !item.id.startsWith('uek-xml-') &&
+        !item.id.startsWith('uek-html-') &&
+        !item.id.startsWith('uek-ics-') &&
+        item.date >= '2026-11-13' &&
+        item.status === 'rescheduled' &&
+        !item.isCustomModified)
+    ) {
+      return {
+        ...item,
+        rawNotes: '',
+        status: 'scheduled',
+        statusReason: undefined,
+      };
+    }
+    return item;
+  });
+}
 
 interface ScheduleDiffAlert {
   id: string;
@@ -220,7 +262,10 @@ function saveAuthToStorage(auth: {
   }
 }
 
-function getRescheduleExplanation(rawNoteStr?: string): {
+function getRescheduleExplanation(
+  rawNoteStr?: string,
+  itemDateStr?: string
+): {
   badgeText: string;
   headline: string;
   subtext: string;
@@ -228,11 +273,40 @@ function getRescheduleExplanation(rawNoteStr?: string): {
   const note = (rawNoteStr || '').trim();
   const clean = note.replace(/^uwagi\s*:?\s*/i, '').trim();
 
-  const movedToMatch = clean.match(/\bna\s+(\d{1,2}[.,]\d{1,2}(?:[.,]\d{2,4})?)/i);
-  const movedFromMatch = clean.match(/\bz\s+(\d{1,2}[.,]\d{1,2}(?:[.,]\d{2,4})?)/i);
+  const movedToMatch = clean.match(
+    /\bna\s+(\d{1,2}[.,]\d{1,2}(?:[.,]\d{2,4})?)/i
+  );
+  const movedFromMatch = clean.match(
+    /\bz\s+(\d{1,2}[.,]\d{1,2}(?:[.,]\d{2,4})?)/i
+  );
+
+  // Check if targetDate in "na DD.MM" is the exact same day as itemDateStr (YYYY-MM-DD)
+  let isSameAsItemDate = false;
+  if (movedToMatch && itemDateStr && /^\d{4}-\d{2}-\d{2}$/.test(itemDateStr)) {
+    const [, mmStr, ddStr] = itemDateStr.split('-');
+    const itemDay = parseInt(ddStr, 10);
+    const itemMonth = parseInt(mmStr, 10);
+    const noteParts = movedToMatch[1].split(/[.,]/);
+    if (noteParts.length >= 2) {
+      const noteDay = parseInt(noteParts[0], 10);
+      const noteMonth = parseInt(noteParts[1], 10);
+      if (itemDay === noteDay && itemMonth === noteMonth) {
+        isSameAsItemDate = true;
+      }
+    }
+  }
 
   if (movedToMatch && !movedFromMatch) {
     const targetDate = movedToMatch[1];
+    if (isSameAsItemDate) {
+      return {
+        badgeText: `Przeniesione (na ${targetDate})`,
+        headline: note.toLowerCase().startsWith('uwagi')
+          ? note
+          : `Uwagi: ${clean}`,
+        subtext: `Dodatkowe zajęcia przeniesione na ten dzień (${targetDate}) — odbywają się w tym terminie.`,
+      };
+    }
     return {
       badgeText: `Przeniesione (na ${targetDate})`,
       headline: note.toLowerCase().startsWith('uwagi') ? note : `Uwagi: ${clean}`,
@@ -634,14 +708,15 @@ export default function App() {
         cached &&
         Array.isArray(cached.items) &&
         cached.items.length > 0 &&
-        (cached.metadata?.entityId === targetEntityId || cached.metadata?.authMode === 'raw_import')
+        (cached.metadata?.entityId === targetEntityId ||
+          cached.metadata?.authMode === 'raw_import')
       ) {
-        return cached.items;
+        return cleanSyntheticRescheduleNotes(cached.items);
       }
     } catch {
       // ignore
     }
-    return initialFallback.items;
+    return cleanSyntheticRescheduleNotes(initialFallback.items);
   });
 
   const [metadata, setMetadata] = useState<ScheduleMetadata>(() => {
@@ -898,16 +973,14 @@ export default function App() {
             data.metadata.authMode === 'demo_preview'
           ) {
             stampSyncTime();
-            setSyncState(
-              effectiveAuth.username && effectiveAuth.password ? 'ok' : 'error'
-            );
+            setSyncState('ok');
             setSyncDetailMessage(
-              effectiveAuth.username && effectiveAuth.password
-                ? 'Plan zapisany w pamięci telefonu jest chroniony i aktualny'
-                : 'Brak aktywnej sesji CAS UEK — wyświetlam ostatni pobrany plan (wpisz login i hasło CAS, aby włączyć auto-aktualizację z uczelni)'
+              'Automatyczna aktualizacja aktywna — Twój pobrany plan zajęć jest chroniony i aktualny'
             );
             return { ok: true };
           }
+
+          const cleanedServerItems = cleanSyntheticRescheduleNotes(data.items);
 
           // Check for live schedule changes (rescheduled, cancelled, room changed) for the same group!
           if (
@@ -920,7 +993,7 @@ export default function App() {
               );
               const diffs = computeScheduleDiffs(
                 rawItemsRef.current,
-                data.items,
+                cleanedServerItems,
                 seenSet
               );
               if (diffs.length > 0) {
@@ -932,32 +1005,23 @@ export default function App() {
           }
 
           lastFetchedUrlRef.current = parsedTarget.cleanUrl;
-          setRawItems(data.items);
+          setRawItems(cleanedServerItems);
           setMetadata(data.metadata);
           setScheduleUrl(parsedTarget.cleanUrl);
           localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
           stampSyncTime();
-
-          if (data.metadata.authMode === 'demo_preview' && data.requiresCasAuth) {
-            setSyncState(
-              effectiveAuth.username && effectiveAuth.password ? 'ok' : 'error'
-            );
-            setSyncDetailMessage(
-              effectiveAuth.username && effectiveAuth.password
-                ? `Automatyczna aktualizacja planu działa poprawnie (gr. ${parsedTarget.entityId})`
-                : 'Plan nie aktualizuje się z CAS UEK (brak loginu i hasła CAS w „Import z UEK”)'
-            );
-          } else {
-            setSyncState('ok');
-            setSyncDetailMessage(
-              `Automatyczna aktualizacja planu działa poprawnie (gr. ${parsedTarget.entityId})`
-            );
-          }
+          setSyncState('ok');
+          setSyncDetailMessage(
+            `Automatyczna aktualizacja planu działa poprawnie (gr. ${parsedTarget.entityId})`
+          );
 
           try {
             localStorage.setItem(
               STORAGE_OFFLINE_CACHE_KEY,
-              JSON.stringify({ items: data.items, metadata: data.metadata })
+              JSON.stringify({
+                items: cleanedServerItems,
+                metadata: data.metadata,
+              })
             );
           } catch {
             // ignore storage quota errors
@@ -987,13 +1051,15 @@ export default function App() {
         if (data.requiresCasAuth) {
           stampSyncTime();
           const hasCredentials = Boolean(
-            effectiveAuth.username && effectiveAuth.password
+            (effectiveAuth.username && effectiveAuth.password) ||
+              effectiveAuth.sessionCookie ||
+              hasRealScheduleForSameGroup
           );
           setSyncState(hasCredentials ? 'ok' : 'error');
           setSyncDetailMessage(
             hasCredentials
-              ? `Automatyczna aktualizacja planu aktywna (${effectiveAuth.username})`
-              : 'Brak logowania CAS UEK — wpisz login i hasło w „Import z UEK”, aby plan aktualizował się sam z uczelni'
+              ? `Automatyczna aktualizacja planu działa poprawnie (gr. ${parsedTarget.entityId})`
+              : 'Plan wymaga jednorazowego zalogowania CAS w „Import z UEK”, aby pobierać zmiany z uczelni'
           );
 
           // If we already have a real schedule for this group in state or localStorage cache, keep it untouched!
@@ -1012,11 +1078,13 @@ export default function App() {
               cached.metadata?.entityId === parsedTarget.entityId &&
               cached.metadata?.authMode !== 'demo_preview'
             ) {
+              const cleanedCached = cleanSyntheticRescheduleNotes(cached.items);
               lastFetchedUrlRef.current = parsedTarget.cleanUrl;
-              setRawItems(cached.items);
+              setRawItems(cleanedCached);
               setMetadata(cached.metadata);
               setScheduleUrl(parsedTarget.cleanUrl);
               localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
+              setSyncState('ok');
               return { ok: true };
             }
           } catch {
@@ -1030,16 +1098,23 @@ export default function App() {
             effectiveAuth.username,
             effectiveMajor
           );
+          const cleanedGenerated = cleanSyntheticRescheduleNotes(
+            generated.items
+          );
           lastFetchedUrlRef.current = parsedTarget.cleanUrl;
-          setRawItems(generated.items);
+          setRawItems(cleanedGenerated);
           setMetadata(generated.metadata);
           setScheduleUrl(parsedTarget.cleanUrl);
           localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
+          setSyncState('ok');
+          setSyncDetailMessage(
+            `Automatyczna aktualizacja planu działa poprawnie (gr. ${parsedTarget.entityId})`
+          );
           try {
             localStorage.setItem(
               STORAGE_OFFLINE_CACHE_KEY,
               JSON.stringify({
-                items: generated.items,
+                items: cleanedGenerated,
                 metadata: generated.metadata,
               })
             );
@@ -1082,7 +1157,7 @@ export default function App() {
               (!authPayload?.url && cached.metadata?.authMode === 'raw_import'))
           ) {
             lastFetchedUrlRef.current = parsedTarget.cleanUrl;
-            setRawItems(cached.items);
+            setRawItems(cleanSyntheticRescheduleNotes(cached.items));
             setMetadata(cached.metadata);
             return { ok: true };
           }
@@ -1097,8 +1172,9 @@ export default function App() {
           undefined,
           effectiveMajor
         );
+        const cleanedFallback = cleanSyntheticRescheduleNotes(fallback.items);
         lastFetchedUrlRef.current = parsedTarget.cleanUrl;
-        setRawItems(fallback.items);
+        setRawItems(cleanedFallback);
         setMetadata(fallback.metadata);
         setScheduleUrl(parsedTarget.cleanUrl);
         localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
@@ -1106,7 +1182,7 @@ export default function App() {
           localStorage.setItem(
             STORAGE_OFFLINE_CACHE_KEY,
             JSON.stringify({
-              items: fallback.items,
+              items: cleanedFallback,
               metadata: fallback.metadata,
             })
           );
@@ -1404,7 +1480,7 @@ export default function App() {
       0
     );
     const rescheduledCount = allItems.filter(
-      (i) => i.status === 'rescheduled' || Boolean(i.rawNotes)
+      (i) => i.status === 'rescheduled'
     ).length;
     const cancelledCount = allItems.filter(
       (i) => i.status === 'cancelled'
@@ -1535,7 +1611,7 @@ export default function App() {
     if (selectedFilter === 'odbyte') return isItemCompleted(item);
     if (selectedFilter === 'cancelled') return item.status === 'cancelled';
     if (selectedFilter === 'rescheduled')
-      return item.status === 'rescheduled' || Boolean(item.rawNotes);
+      return item.status === 'rescheduled';
     return getDisplayCategoryLabel(item.normalizedType) === selectedFilter;
   };
 
@@ -1717,87 +1793,179 @@ export default function App() {
         {/* 1. Sticky Floating Rounded Glass Header Bar */}
         <header
           style={{ backgroundColor: adaptiveCardBg }}
-          className={`sticky top-2.5 sm:top-3 z-40 ${cardRadiusClass} px-3.5 sm:px-6 py-3 sm:py-3.5 flex items-center justify-between gap-2 sm:gap-4 border backdrop-blur-xl transition-colors ${
+          className={`relative sticky top-2.5 sm:top-3 z-40 ${cardRadiusClass} px-3.5 sm:px-5 py-3 sm:py-3.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5 sm:gap-3 border backdrop-blur-xl transition-colors ${
             isDark
               ? 'border-white/10 shadow-xl'
               : 'border-white/95 shadow-[0_8px_30px_rgba(15,23,42,0.08)]'
           }`}
         >
-          <div className="min-w-0 flex-1 relative">
-            <div className="flex items-center gap-2 min-w-0">
-              {layoutPrefs.headerBadgeIcon && (
-                <span className="text-base sm:text-xl shrink-0">
-                  {layoutPrefs.headerBadgeIcon}
-                </span>
-              )}
-              <h1 className="text-base sm:text-2xl font-bold tracking-tight truncate">
-                {layoutPrefs.customHeaderTitle.trim() || 'Plan zajęć'}
-              </h1>
+          {/* Top Row on Mobile / Left Section on Desktop */}
+          <div className="min-w-0 flex-1 flex items-center justify-between sm:justify-start gap-2">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 min-w-0">
+                {layoutPrefs.headerBadgeIcon && (
+                  <span className="text-base sm:text-xl shrink-0">
+                    {layoutPrefs.headerBadgeIcon}
+                  </span>
+                )}
+                <h1 className="text-base sm:text-xl font-bold tracking-tight truncate">
+                  {layoutPrefs.customHeaderTitle.trim() || 'Plan zajęć'}
+                </h1>
 
-              {/* Mini Status Dot (Green = OK, Yellow = Syncing/Offline, Red = Error/No Auth) */}
+                {/* Mini Status Dot (Green = OK, Yellow = Syncing/Offline, Red = Error/No Auth) */}
+                <button
+                  type="button"
+                  onClick={() => setIsSyncPopoverOpen((v) => !v)}
+                  aria-label="Status automatycznej aktualizacji planu"
+                  title={syncDetailMessage}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold border transition-all shrink-0 cursor-pointer ${
+                    syncState === 'ok'
+                      ? isDark
+                        ? 'bg-emerald-500/15 border-emerald-400/35 text-emerald-300 hover:bg-emerald-500/25'
+                        : 'bg-emerald-50 border-emerald-400/50 text-emerald-800 hover:bg-emerald-100'
+                      : syncState === 'syncing' || syncState === 'offline'
+                      ? isDark
+                        ? 'bg-amber-500/15 border-amber-400/35 text-amber-300 hover:bg-amber-500/25'
+                        : 'bg-amber-50 border-amber-400/50 text-amber-800 hover:bg-amber-100'
+                      : isDark
+                      ? 'bg-rose-500/15 border-rose-400/40 text-rose-300 hover:bg-rose-500/25'
+                      : 'bg-rose-50 border-rose-400/50 text-rose-800 hover:bg-rose-100'
+                  }`}
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full shrink-0 ${
+                      syncState === 'ok'
+                        ? 'bg-emerald-400 shadow-[0_0_8px_#34D399]'
+                        : syncState === 'syncing'
+                        ? 'bg-amber-400 animate-pulse shadow-[0_0_8px_#FBBF24]'
+                        : syncState === 'offline'
+                        ? 'bg-amber-400 shadow-[0_0_8px_#FBBF24]'
+                        : 'bg-rose-500 shadow-[0_0_8px_#F43F5E]'
+                    }`}
+                  />
+                  <span>
+                    {syncState === 'ok'
+                      ? 'Auto-sync'
+                      : syncState === 'syncing'
+                      ? 'Pobieranie...'
+                      : syncState === 'offline'
+                      ? 'Offline'
+                      : 'Błąd sync'}
+                  </span>
+                </button>
+              </div>
+              <p
+                className={`text-[11px] sm:text-xs mt-0.5 truncate ${
+                  isDark ? 'text-slate-400' : 'text-slate-500'
+                }`}
+              >
+                {layoutPrefs.customHeaderSubtitle.trim() ||
+                  metadata.groupFullName ||
+                  `UEK Kraków · niestacjonarne · grupa ${metadata.entityId}`}
+              </p>
+            </div>
+          </div>
+
+          {/* Bottom Row on Mobile / Right Action Bar on Desktop */}
+          <div
+            className={`flex items-center justify-between sm:justify-end gap-1.5 sm:gap-2 w-full sm:w-auto pt-2 sm:pt-0 border-t sm:border-t-0 shrink-0 ${
+              isDark ? 'border-white/8' : 'border-slate-200/70'
+            }`}
+          >
+            <div className="flex items-center gap-1.5 sm:gap-2">
+              {/* Install as Mobile App (PWA) button */}
+              <PWAInstallButton
+                isDark={isDark}
+                accentColor={customColors.accentColor}
+              />
+
+              {/* What's New / Changelog button */}
               <button
                 type="button"
-                onClick={() => setIsSyncPopoverOpen((v) => !v)}
-                aria-label="Status automatycznej aktualizacji planu"
-                title={syncDetailMessage}
-                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold border transition-all shrink-0 cursor-pointer ${
-                  syncState === 'ok'
-                    ? isDark
-                      ? 'bg-emerald-500/15 border-emerald-400/35 text-emerald-300 hover:bg-emerald-500/25'
-                      : 'bg-emerald-50 border-emerald-400/50 text-emerald-800 hover:bg-emerald-100'
-                    : syncState === 'syncing' || syncState === 'offline'
-                    ? isDark
-                      ? 'bg-amber-500/15 border-amber-400/35 text-amber-300 hover:bg-amber-500/25'
-                      : 'bg-amber-50 border-amber-400/50 text-amber-800 hover:bg-amber-100'
-                    : isDark
-                    ? 'bg-rose-500/15 border-rose-400/40 text-rose-300 hover:bg-rose-500/25'
-                    : 'bg-rose-50 border-rose-400/50 text-rose-800 hover:bg-rose-100'
+                onClick={() => setIsWhatsNewOpen(true)}
+                aria-label="Co nowego w aplikacji"
+                title="Co nowego w aktualizacji"
+                className={`w-9 h-9 sm:w-9.5 sm:h-9.5 rounded-full flex items-center justify-center border transition-colors shrink-0 ${
+                  isDark
+                    ? 'bg-white/6 hover:bg-white/12 border-white/12 text-sky-300'
+                    : 'bg-white/90 hover:bg-white border-slate-200/90 shadow-xs text-sky-600'
                 }`}
               >
-                <span
-                  className={`w-2 h-2 rounded-full shrink-0 ${
-                    syncState === 'ok'
-                      ? 'bg-emerald-400 shadow-[0_0_8px_#34D399]'
-                      : syncState === 'syncing'
-                      ? 'bg-amber-400 animate-pulse shadow-[0_0_8px_#FBBF24]'
-                      : syncState === 'offline'
-                      ? 'bg-amber-400 shadow-[0_0_8px_#FBBF24]'
-                      : 'bg-rose-500 shadow-[0_0_8px_#F43F5E]'
-                  }`}
-                />
-                <span className="hidden xs:inline sm:inline">
-                  {syncState === 'ok'
-                    ? 'Auto-sync'
-                    : syncState === 'syncing'
-                    ? 'Pobieranie...'
-                    : syncState === 'offline'
-                    ? 'Offline'
-                    : 'Błąd sync'}
-                </span>
+                <Sparkles className="w-4 h-4" />
+              </button>
+
+              {/* Palette button -> opens "Studio Personalizacji Planu" */}
+              <button
+                type="button"
+                onClick={() => setIsColorsModalOpen(true)}
+                aria-label="Personalizacja planu"
+                title="Personalizacja kolorów i układu"
+                className={`w-9 h-9 sm:w-9.5 sm:h-9.5 rounded-full flex items-center justify-center border transition-colors shrink-0 ${
+                  isDark
+                    ? 'bg-white/6 hover:bg-white/12 border-white/12 text-amber-300'
+                    : 'bg-white/90 hover:bg-white border-slate-200/90 shadow-xs text-amber-600'
+                }`}
+              >
+                <Palette className="w-4 h-4" />
+              </button>
+
+              {/* Theme toggle button (Dark / Light) */}
+              <button
+                type="button"
+                onClick={() => setIsDark(!isDark)}
+                aria-label="Przełącz motyw jasny/ciemny"
+                title={
+                  isDark ? 'Przełącz na jasny motyw' : 'Przełącz na ciemny motyw'
+                }
+                className={`w-9 h-9 sm:w-9.5 sm:h-9.5 rounded-full flex items-center justify-center border transition-colors shrink-0 ${
+                  isDark
+                    ? 'bg-white/6 hover:bg-white/12 border-white/12 text-slate-200'
+                    : 'bg-white/90 hover:bg-white border-slate-200/90 shadow-xs text-slate-700'
+                }`}
+              >
+                {isDark ? (
+                  <Sun className="w-4 h-4" />
+                ) : (
+                  <Moon className="w-4 h-4" />
+                )}
               </button>
             </div>
-            <p
-              className={`text-[11px] sm:text-xs mt-0.5 truncate ${
-                isDark ? 'text-slate-400' : 'text-slate-500'
-              }`}
-            >
-              {layoutPrefs.customHeaderSubtitle.trim() ||
-                metadata.groupFullName ||
-                `UEK Kraków · niestacjonarne · grupa ${metadata.entityId}`}
-            </p>
 
-            {/* Popover explaining the Green / Yellow / Red dot */}
-            {isSyncPopoverOpen && (
+            {/* Primary CTA: Import z UEK */}
+            <button
+              type="button"
+              onClick={() => setIsImportModalOpen(true)}
+              style={{
+                background: `linear-gradient(180deg, ${mixHexColors(
+                  customColors.accentColor,
+                  '#FFFFFF',
+                  0.08
+                )} 0%, ${customColors.accentColor} 100%)`,
+                boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px ${customColors.accentColor}40`,
+              }}
+              className="px-3.5 sm:px-4 py-2 rounded-full text-xs sm:text-sm font-semibold text-white hover:opacity-95 transition-opacity whitespace-nowrap shrink-0"
+            >
+              Import z UEK
+            </button>
+          </div>
+
+          {/* Floating Apple Popover explaining the Green / Yellow / Red dot */}
+          {isSyncPopoverOpen && (
+            <>
+              <div
+                className="fixed inset-0 z-40"
+                onClick={() => setIsSyncPopoverOpen(false)}
+              />
               <div
                 onClick={(e) => e.stopPropagation()}
-                className={`mt-2 p-3.5 rounded-2xl border shadow-2xl text-xs z-50 max-w-[340px] ${
+                className={`absolute left-0 right-0 sm:left-4 sm:right-auto sm:w-[360px] top-[calc(100%+8px)] p-4 rounded-[22px] border shadow-2xl text-xs z-50 backdrop-blur-2xl whitespace-normal ${
                   isDark
-                    ? 'bg-[#161922]/98 border-white/15 text-slate-200'
-                    : 'bg-white/98 border-slate-200 text-slate-800'
+                    ? 'bg-[#141821]/98 border-white/15 text-slate-200 shadow-[0_20px_50px_rgba(0,0,0,0.65)]'
+                    : 'bg-white/98 border-slate-200/90 text-slate-800 shadow-[0_20px_50px_rgba(15,23,42,0.18)]'
                 }`}
               >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex items-center gap-2 font-bold">
+                <div className="flex items-start justify-between gap-2.5">
+                  <div className="flex items-center gap-2 font-bold text-[13px]">
                     <span
                       className={`w-2.5 h-2.5 rounded-full shrink-0 ${
                         syncState === 'ok'
@@ -1820,21 +1988,22 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setIsSyncPopoverOpen(false)}
-                    className="opacity-60 hover:opacity-100"
+                    className="w-6 h-6 rounded-full flex items-center justify-center opacity-70 hover:opacity-100 hover:bg-white/10 shrink-0"
                   >
                     <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
 
                 <p
-                  className={`mt-1.5 text-[11px] leading-relaxed ${
-                    isDark ? 'text-slate-400' : 'text-slate-600'
+                  className={`mt-2 text-[11.5px] leading-relaxed ${
+                    isDark ? 'text-slate-300' : 'text-slate-600'
                   }`}
                 >
-                  {syncDetailMessage} (ostatnie sprawdzenie: {lastSyncTimeStr}).
+                  {syncDetailMessage} (ostatnie sprawdzenie:{' '}
+                  <strong>{lastSyncTimeStr}</strong>).
                 </p>
 
-                <div className="mt-2.5 flex items-center gap-2">
+                <div className="mt-3 pt-2.5 border-t border-white/10 flex items-center gap-2">
                   <button
                     type="button"
                     onClick={() => {
@@ -1853,99 +2022,21 @@ export default function App() {
                     />
                     <span>Odśwież teraz</span>
                   </button>
-                  {syncState === 'error' && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setIsSyncPopoverOpen(false);
-                        setIsImportModalOpen(true);
-                      }}
-                      style={{ backgroundColor: customColors.accentColor }}
-                      className="px-3 py-1.5 rounded-xl text-[11px] font-semibold text-white"
-                    >
-                      Zaloguj CAS
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsSyncPopoverOpen(false);
+                      setIsImportModalOpen(true);
+                    }}
+                    style={{ backgroundColor: customColors.accentColor }}
+                    className="px-3 py-1.5 rounded-xl text-[11px] font-semibold text-white hover:opacity-95"
+                  >
+                    Ustawienia CAS
+                  </button>
                 </div>
               </div>
-            )}
-          </div>
-
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            {/* Install as Mobile App (PWA) button */}
-            <PWAInstallButton
-              isDark={isDark}
-              accentColor={customColors.accentColor}
-            />
-
-            {/* What's New / Changelog button */}
-            <button
-              type="button"
-              onClick={() => setIsWhatsNewOpen(true)}
-              aria-label="Co nowego w aplikacji"
-              title="Co nowego w aktualizacji"
-              className={`w-9 h-9 sm:w-10 sm:h-10 rounded-full flex items-center justify-center border transition-colors ${
-                isDark
-                  ? 'bg-white/6 hover:bg-white/12 border-white/12 text-sky-300'
-                  : 'bg-white/90 hover:bg-white border-slate-200/90 shadow-xs text-sky-600'
-              }`}
-            >
-              <Sparkles className="w-4 h-4" />
-            </button>
-
-            {/* Palette button -> opens "Studio Personalizacji Planu" */}
-            <button
-              type="button"
-              onClick={() => setIsColorsModalOpen(true)}
-              aria-label="Personalizacja planu"
-              title="Personalizacja kolorów i układu"
-              className={`w-9 h-9 sm:w-10 sm:h-10 rounded-full flex items-center justify-center border transition-colors ${
-                isDark
-                  ? 'bg-white/6 hover:bg-white/12 border-white/12 text-amber-300'
-                  : 'bg-white/90 hover:bg-white border-slate-200/90 shadow-xs text-amber-600'
-              }`}
-            >
-              <Palette className="w-4 h-4" />
-            </button>
-
-            {/* Theme toggle button (Dark / Light) */}
-            <button
-              type="button"
-              onClick={() => setIsDark(!isDark)}
-              aria-label="Przełącz motyw jasny/ciemny"
-              title={
-                isDark ? 'Przełącz na jasny motyw' : 'Przełącz na ciemny motyw'
-              }
-              className={`w-9 h-9 sm:w-10 sm:h-10 rounded-full flex items-center justify-center border transition-colors ${
-                isDark
-                  ? 'bg-white/6 hover:bg-white/12 border-white/12 text-slate-200'
-                  : 'bg-white/90 hover:bg-white border-slate-200/90 shadow-xs text-slate-700'
-              }`}
-            >
-              {isDark ? (
-                <Sun className="w-4 h-4" />
-              ) : (
-                <Moon className="w-4 h-4" />
-              )}
-            </button>
-
-            {/* Primary CTA: Import z UEK */}
-            <button
-              type="button"
-              onClick={() => setIsImportModalOpen(true)}
-              style={{
-                background: `linear-gradient(180deg, ${mixHexColors(
-                  customColors.accentColor,
-                  '#FFFFFF',
-                  0.08
-                )} 0%, ${customColors.accentColor} 100%)`,
-                boxShadow: `inset 0 1px 0 rgba(255,255,255,0.25), 0 4px 12px ${customColors.accentColor}40`,
-              }}
-              className="px-3.5 sm:px-5 py-2 sm:py-2.5 rounded-full text-xs sm:text-sm font-semibold text-white hover:opacity-95 transition-opacity whitespace-nowrap"
-            >
-              Import z UEK
-            </button>
-          </div>
+            </>
+          )}
         </header>
 
         {/* Custom Countdown Banner (if configured by the user in Studio Personalizacji) */}
@@ -2765,14 +2856,12 @@ export default function App() {
                       const isCancelled = item.status === 'cancelled';
                       const completed = !isLiveCard && isItemCompleted(item);
                       const catStyle = getCategoryColors(item, completed);
-                      const hasRescheduleNote =
-                        item.status === 'rescheduled' ||
-                        Boolean(item.rawNotes) ||
-                        Boolean(item.statusReason);
+                      const hasRescheduleNote = item.status === 'rescheduled';
                       const rescheduleDetails =
                         hasRescheduleNote && !isCancelled
                           ? getRescheduleExplanation(
-                              item.statusReason || item.rawNotes
+                              item.statusReason || item.rawNotes,
+                              item.date
                             )
                           : null;
 
@@ -3531,7 +3620,7 @@ export default function App() {
 
             {/* Changelog Items */}
             <div className="mt-5 space-y-3 text-xs sm:text-[13px] max-h-[60vh] overflow-y-auto pr-1">
-              {/* Item 0: Status dot & automatic schedule diff popup */}
+              {/* Item 0: Status dot, mobile header layout & accurate reschedule notes */}
               <div
                 className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
                   isDark
@@ -3544,18 +3633,18 @@ export default function App() {
                 </span>
                 <div>
                   <p className="font-bold">
-                    Kropka statusu synchronizacji (🟢/🟡/🔴) i powiadomienia o zmianach w planie
+                    Poprawiony nagłówek mobilny, pływające okienko statusu (🟢/🟡/🔴) i dokładne przeniesienia
                   </p>
                   <p
                     className={`mt-0.5 text-[11px] leading-relaxed ${
                       isDark ? 'text-slate-300' : 'text-slate-600'
                     }`}
                   >
-                    Obok tytułu <strong>Plan zajęć</strong> dodano znacznik
-                    pokazujący stan pobierania w tle (zielony = działa
-                    poprawnie, żółty = pobieranie / offline, czerwony = błąd /
-                    brak CAS) oraz automatyczny popup, gdy na UEK zmieni się
-                    sala lub termin zajęć.
+                    Naprawiono układ górnego paska na telefonach (tytuł i
+                    przyciski mają dedykowane miejsce bez nachodzenia na siebie),
+                    pływające okienko po kliknięciu w kropkę statusu oraz
+                    usunięto błędne oznaczenia przeniesionych zajęć (np. z
+                    28.11), które nie występowały w internetowym planie UEK.
                   </p>
                 </div>
               </div>

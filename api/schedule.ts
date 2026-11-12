@@ -300,17 +300,16 @@ function detectStatusFromFields(
   }
 
   if (
-    effectiveNotes.length > 0 ||
-    combined.includes('uwagi') ||
     combined.includes('przeniesion') ||
     combined.includes('przeniesienie') ||
     combined.includes('przełożon') ||
     combined.includes('przelozon') ||
     combined.includes('na dzień') ||
     combined.includes('z dnia') ||
-    combined.includes('odrabianie') ||
+    combined.includes('odrabian') ||
     combined.includes('zmiana terminu') ||
-    /\b(z|na)\s+\d{1,2}\.\d{1,2}\b/i.test(combined)
+    combined.includes('zmiana godziny') ||
+    /\b(z|na)\s*\d{1,2}[.,]\d{1,2}\b/i.test(combined)
   ) {
     const cleanNote = effectiveNotes || notesStr.trim() || typeStr.trim();
     const formattedReason = cleanNote.toLowerCase().startsWith('uwagi')
@@ -331,6 +330,7 @@ function detectStatusFromFields(
 
   return {
     status: 'scheduled',
+    statusReason: effectiveNotes || undefined,
   };
 }
 

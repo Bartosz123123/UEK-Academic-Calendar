@@ -250,17 +250,16 @@ export function detectStatusFromFields(
   }
 
   if (
-    effectiveNotes.length > 0 ||
-    combined.includes('uwagi') ||
     combined.includes('przeniesion') ||
     combined.includes('przeniesienie') ||
     combined.includes('przełożon') ||
     combined.includes('przelozon') ||
     combined.includes('na dzień') ||
     combined.includes('z dnia') ||
-    combined.includes('odrabianie') ||
+    combined.includes('odrabian') ||
     combined.includes('zmiana terminu') ||
-    /\b(z|na)\s+\d{1,2}\.\d{1,2}\b/i.test(combined)
+    combined.includes('zmiana godziny') ||
+    /\b(z|na)\s*\d{1,2}[.,]\d{1,2}\b/i.test(combined)
   ) {
     const cleanNote = effectiveNotes || notesStr.trim() || typeStr.trim();
     const formattedReason = cleanNote.toLowerCase().startsWith('uwagi')
@@ -281,6 +280,7 @@ export function detectStatusFromFields(
 
   return {
     status: 'scheduled',
+    statusReason: effectiveNotes || undefined,
   };
 }
 
@@ -1717,9 +1717,8 @@ export function generateRealisticUekSchedule(
       lecturer: 'dr Artur Żuwała',
       room: 'Paw.A 122 lab. komputerowe',
       isOnlineLocation: false,
-      rawNotes: idx === 0 ? 'Uwagi: na 14.11' : '',
-      status: idx === 0 ? 'rescheduled' : 'scheduled',
-      statusReason: idx === 0 ? 'Uwagi: na 14.11' : undefined,
+      rawNotes: '',
+      status: 'scheduled',
     });
 
     items.push({
@@ -1736,9 +1735,8 @@ export function generateRealisticUekSchedule(
       lecturer: 'mgr Dominik Kuc',
       room: 'Paw.A 119 lab. komputerowe',
       isOnlineLocation: false,
-      rawNotes: idx === 1 ? 'Uwagi: na 28.11' : '',
-      status: idx === 1 ? 'rescheduled' : 'scheduled',
-      statusReason: idx === 1 ? 'Uwagi: na 28.11' : undefined,
+      rawNotes: '',
+      status: 'scheduled',
     });
 
     items.push({
@@ -1755,9 +1753,8 @@ export function generateRealisticUekSchedule(
       lecturer: 'prof. UEK dr hab. Mariusz Grabowski',
       room: 'Paw.C 304',
       isOnlineLocation: false,
-      rawNotes: idx === 2 ? 'Uwagi: na 6.12' : '',
-      status: idx === 2 ? 'rescheduled' : 'scheduled',
-      statusReason: idx === 2 ? 'Uwagi: na 6.12' : undefined,
+      rawNotes: '',
+      status: 'scheduled',
     });
 
     if (count === 5) {
@@ -1775,9 +1772,8 @@ export function generateRealisticUekSchedule(
         lecturer: 'mgr Dominik Kuc',
         room: 'Paw.A 214 lab. komputerowe',
         isOnlineLocation: false,
-        rawNotes: idx === 0 ? 'Uwagi: na 15.11' : '',
-        status: idx === 0 ? 'rescheduled' : 'scheduled',
-        statusReason: idx === 0 ? 'Uwagi: na 15.11' : undefined,
+        rawNotes: '',
+        status: 'scheduled',
       });
     }
   });
@@ -2129,33 +2125,6 @@ function generateDynamicNiestacjonarneScheduleForGroup(
       });
     }
 
-    const sat1Note =
-      zIdx === 4
-        ? 'Uwagi: przeniesione na 7.11 (MS Teams)'
-        : zIdx === 5
-        ? 'Uwagi: przeniesione z 24.10'
-        : zIdx === 7
-        ? 'Uwagi: odrabianie zajęć z 14.11'
-        : '';
-
-    const sat2Note =
-      zIdx === 2
-        ? 'Uwagi: przeniesione na 17.10'
-        : zIdx === 3
-        ? 'Uwagi: przeniesione z 17.10'
-        : zIdx === 6
-        ? 'Uwagi: zmiana godziny (z 13:30)'
-        : '';
-
-    const sun2Note =
-      zIdx === 4
-        ? 'Uwagi: na 8.11 (MS Teams)'
-        : zIdx === 5
-        ? 'Uwagi: przeniesione na 15.11'
-        : zIdx === 8
-        ? 'Uwagi: kolokwium zaliczeniowe'
-        : '';
-
     // Saturday classes
     rawItems.push(
       {
@@ -2170,9 +2139,8 @@ function generateDynamicNiestacjonarneScheduleForGroup(
         lecturer: s1.lecturer,
         room: zIdx < 4 ? 'Online' : s1.cwRoom,
         isOnlineLocation: zIdx < 4,
-        rawNotes: sat1Note,
-        status: sat1Note ? 'rescheduled' : 'scheduled',
-        statusReason: sat1Note || undefined,
+        rawNotes: '',
+        status: 'scheduled',
       },
       {
         id: `uek-${parsed.entityId}-${sat}-2`,
@@ -2186,9 +2154,8 @@ function generateDynamicNiestacjonarneScheduleForGroup(
         lecturer: s2.lecturer,
         room: s2.cwRoom,
         isOnlineLocation: false,
-        rawNotes: sat2Note,
-        status: sat2Note ? 'rescheduled' : 'scheduled',
-        statusReason: sat2Note || undefined,
+        rawNotes: '',
+        status: 'scheduled',
       },
       {
         id: `uek-${parsed.entityId}-${sat}-3`,
@@ -2237,9 +2204,8 @@ function generateDynamicNiestacjonarneScheduleForGroup(
           lecturer: s3.lecturer,
           room: 'Online',
           isOnlineLocation: true,
-          rawNotes: sun2Note,
-          status: sun2Note ? 'rescheduled' : 'scheduled',
-          statusReason: sun2Note || undefined,
+          rawNotes: '',
+          status: 'scheduled',
         }
       );
     }
