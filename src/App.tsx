@@ -6,6 +6,7 @@ import {
   MapPin,
   Moon,
   Palette,
+  RefreshCw,
   Sparkles,
   Sun,
   X,
@@ -57,7 +58,99 @@ const STORAGE_LAYOUT_PREFS_KEY = 'uek_apple_schedule_layout_v1';
 const STORAGE_THEME_MODE_KEY = 'uek_apple_schedule_dark_v2';
 const STORAGE_OFFLINE_CACHE_KEY = 'uek_apple_schedule_offline_cache_v2';
 const STORAGE_SEEN_VERSION_KEY = 'uek_apple_schedule_seen_version_v1';
-const CURRENT_APP_VERSION = '2.6.0';
+const STORAGE_SEEN_DIFFS_KEY = 'uek_apple_schedule_seen_diffs_v1';
+const CURRENT_APP_VERSION = '2.8.0';
+
+interface ScheduleDiffAlert {
+  id: string;
+  kind: 'rescheduled' | 'cancelled' | 'room_changed';
+  subject: string;
+  date: string;
+  time: string;
+  headline: string;
+  detail: string;
+}
+
+function computeScheduleDiffs(
+  prevItems: ScheduleItem[],
+  nextItems: ScheduleItem[],
+  seenIds: Set<string>
+): ScheduleDiffAlert[] {
+  if (!prevItems.length || !nextItems.length) return [];
+  const alerts: ScheduleDiffAlert[] = [];
+
+  for (const next of nextItems) {
+    const prev =
+      prevItems.find(
+        (p) =>
+          p.date === next.date &&
+          p.startTime === next.startTime &&
+          p.subject === next.subject
+      ) ||
+      prevItems.find(
+        (p) => p.date === next.date && p.startTime === next.startTime
+      );
+
+    if (!prev) continue;
+
+    const prevNote = (prev.statusReason || prev.rawNotes || '').trim();
+    const nextNote = (next.statusReason || next.rawNotes || '').trim();
+
+    if (next.status === 'cancelled' && prev.status !== 'cancelled') {
+      const id = `cancel:${next.date}:${next.startTime}:${next.subject}`;
+      if (!seenIds.has(id)) {
+        alerts.push({
+          id,
+          kind: 'cancelled',
+          subject: next.subject,
+          date: next.date,
+          time: `${next.startTime}–${next.endTime}`,
+          headline: 'Zajęcia zostały odwołane',
+          detail: nextNote || 'Oznaczono jako odwołane w planie UEK.',
+        });
+      }
+      continue;
+    }
+
+    if (
+      (next.status === 'rescheduled' || nextNote.length > 0) &&
+      prevNote !== nextNote
+    ) {
+      const id = `resched:${next.date}:${next.startTime}:${next.subject}:${nextNote}`;
+      if (!seenIds.has(id)) {
+        alerts.push({
+          id,
+          kind: 'rescheduled',
+          subject: next.subject,
+          date: next.date,
+          time: `${next.startTime}–${next.endTime}`,
+          headline: nextNote || 'Zajęcia przeniesione',
+          detail: prevNote
+            ? `Poprzednia uwaga: ${prevNote}`
+            : 'Dodano nową adnotację o przeniesieniu terminu na UEK.',
+        });
+      }
+      continue;
+    }
+
+    if (prev.room && next.room && prev.room !== next.room) {
+      const id = `room:${next.date}:${next.startTime}:${next.subject}:${next.room}`;
+      if (!seenIds.has(id)) {
+        alerts.push({
+          id,
+          kind: 'room_changed',
+          subject: next.subject,
+          date: next.date,
+          time: `${next.startTime}–${next.endTime}`,
+          headline: `Zmiana sali: ${next.room}`,
+          detail: `Wcześniej przypisana sala: ${prev.room}`,
+        });
+      }
+    }
+  }
+
+  return alerts;
+}
 
 const SECRET_SALT = 'uek_cas_auto_sync_key_2026';
 
@@ -570,12 +663,73 @@ export default function App() {
     return initialFallback.metadata;
   });
 
+  const rawItemsRef = useRef(rawItems);
+  useEffect(() => {
+    rawItemsRef.current = rawItems;
+  }, [rawItems]);
+
   const metadataRef = useRef(metadata);
   useEffect(() => {
     metadataRef.current = metadata;
   }, [metadata]);
 
   const lastFetchedUrlRef = useRef<string>('');
+
+  // Background auto-sync indicator state ('ok' = green, 'syncing' | 'offline' = yellow, 'error' = red)
+  const [syncState, setSyncState] = useState<
+    'ok' | 'syncing' | 'offline' | 'error'
+  >(() =>
+    typeof navigator !== 'undefined' && !navigator.onLine ? 'offline' : 'ok'
+  );
+  const [lastSyncTimeStr, setLastSyncTimeStr] = useState<string>(() => {
+    const now = new Date();
+    return `${String(now.getHours()).padStart(2, '0')}:${String(
+      now.getMinutes()
+    ).padStart(2, '0')}`;
+  });
+  const [syncDetailMessage, setSyncDetailMessage] = useState<string>(
+    'Automatyczna aktualizacja planu działa poprawnie'
+  );
+  const [isSyncPopoverOpen, setIsSyncPopoverOpen] = useState<boolean>(false);
+
+  // Automatic schedule diff notifications state
+  const [scheduleDiffAlerts, setScheduleDiffAlerts] = useState<
+    ScheduleDiffAlert[]
+  >([]);
+
+  const handleDismissScheduleDiffs = useCallback(() => {
+    try {
+      const existing: string[] = JSON.parse(
+        localStorage.getItem(STORAGE_SEEN_DIFFS_KEY) || '[]'
+      );
+      const merged = Array.from(
+        new Set([...existing, ...scheduleDiffAlerts.map((a) => a.id)])
+      );
+      localStorage.setItem(STORAGE_SEEN_DIFFS_KEY, JSON.stringify(merged));
+    } catch {
+      // ignore
+    }
+    setScheduleDiffAlerts([]);
+  }, [scheduleDiffAlerts]);
+
+  useEffect(() => {
+    const onOnline = () => {
+      setSyncState('ok');
+      setSyncDetailMessage('Połączenie przywrócone — plan aktualny');
+    };
+    const onOffline = () => {
+      setSyncState('offline');
+      setSyncDetailMessage(
+        'Brak internetu (tryb offline) — wyświetlam zapisany plan z pamięci telefonu'
+      );
+    };
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    return () => {
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
+    };
+  }, []);
 
   const [savedAuth, setSavedAuth] = useState<{
     username?: string;
@@ -625,6 +779,25 @@ export default function App() {
       const parsedTarget = parseUekUrl(effectiveUrl);
       const effectiveMajor = authPayload?.major || selectedMajorRef.current;
 
+      const stampSyncTime = () => {
+        const now = new Date();
+        setLastSyncTimeStr(
+          `${String(now.getHours()).padStart(2, '0')}:${String(
+            now.getMinutes()
+          ).padStart(2, '0')}`
+        );
+      };
+
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        setSyncState('offline');
+        setSyncDetailMessage(
+          'Jesteś offline — brak internetu, wyświetlam zapisany plan z pamięci telefonu'
+        );
+      } else {
+        setSyncState('syncing');
+        setSyncDetailMessage('Pobieranie i sprawdzanie zmian w planie UEK...');
+      }
+
       // 1. If raw XML/HTML/.ics/JSON/text was pasted, parse immediately on client
       if (
         authPayload?.rawXmlOrHtml &&
@@ -637,11 +810,35 @@ export default function App() {
           effectiveAuth.username || 'Import bezpośredni'
         );
         if (directParsed && directParsed.items.length > 0) {
+          const prevMeta = metadataRef.current;
+          if (prevMeta.entityId === parsedTarget.entityId) {
+            try {
+              const seenSet = new Set<string>(
+                JSON.parse(localStorage.getItem(STORAGE_SEEN_DIFFS_KEY) || '[]')
+              );
+              const diffs = computeScheduleDiffs(
+                rawItemsRef.current,
+                directParsed.items,
+                seenSet
+              );
+              if (diffs.length > 0) {
+                setScheduleDiffAlerts(diffs);
+              }
+            } catch {
+              // ignore
+            }
+          }
+
           lastFetchedUrlRef.current = parsedTarget.cleanUrl;
           setRawItems(directParsed.items);
           setMetadata(directParsed.metadata);
           setScheduleUrl(parsedTarget.cleanUrl);
           localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
+          stampSyncTime();
+          setSyncState('ok');
+          setSyncDetailMessage(
+            'Plan wczytany z oficjalnych danych UEK — działa poprawnie'
+          );
           try {
             localStorage.setItem(
               STORAGE_OFFLINE_CACHE_KEY,
@@ -675,6 +872,11 @@ export default function App() {
 
         const data = await response.json();
         if (!response.ok) {
+          setSyncState('error');
+          setSyncDetailMessage(
+            data?.error ||
+              'Pobieranie planu z UEK nie powiodło się — sprawdź logowanie CAS'
+          );
           return {
             ok: false,
             requiresCasAuth: data?.requiresCasAuth,
@@ -695,7 +897,38 @@ export default function App() {
             hasRealScheduleForSameGroup &&
             data.metadata.authMode === 'demo_preview'
           ) {
+            stampSyncTime();
+            setSyncState(
+              effectiveAuth.username && effectiveAuth.password ? 'ok' : 'error'
+            );
+            setSyncDetailMessage(
+              effectiveAuth.username && effectiveAuth.password
+                ? 'Plan zapisany w pamięci telefonu jest chroniony i aktualny'
+                : 'Brak aktywnej sesji CAS UEK — wyświetlam ostatni pobrany plan (wpisz login i hasło CAS, aby włączyć auto-aktualizację z uczelni)'
+            );
             return { ok: true };
+          }
+
+          // Check for live schedule changes (rescheduled, cancelled, room changed) for the same group!
+          if (
+            prevMeta.entityId === parsedTarget.entityId &&
+            data.metadata.authMode !== 'demo_preview'
+          ) {
+            try {
+              const seenSet = new Set<string>(
+                JSON.parse(localStorage.getItem(STORAGE_SEEN_DIFFS_KEY) || '[]')
+              );
+              const diffs = computeScheduleDiffs(
+                rawItemsRef.current,
+                data.items,
+                seenSet
+              );
+              if (diffs.length > 0) {
+                setScheduleDiffAlerts(diffs);
+              }
+            } catch {
+              // ignore
+            }
           }
 
           lastFetchedUrlRef.current = parsedTarget.cleanUrl;
@@ -703,6 +936,23 @@ export default function App() {
           setMetadata(data.metadata);
           setScheduleUrl(parsedTarget.cleanUrl);
           localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
+          stampSyncTime();
+
+          if (data.metadata.authMode === 'demo_preview' && data.requiresCasAuth) {
+            setSyncState(
+              effectiveAuth.username && effectiveAuth.password ? 'ok' : 'error'
+            );
+            setSyncDetailMessage(
+              effectiveAuth.username && effectiveAuth.password
+                ? `Automatyczna aktualizacja planu działa poprawnie (gr. ${parsedTarget.entityId})`
+                : 'Plan nie aktualizuje się z CAS UEK (brak loginu i hasła CAS w „Import z UEK”)'
+            );
+          } else {
+            setSyncState('ok');
+            setSyncDetailMessage(
+              `Automatyczna aktualizacja planu działa poprawnie (gr. ${parsedTarget.entityId})`
+            );
+          }
 
           try {
             localStorage.setItem(
@@ -735,6 +985,17 @@ export default function App() {
 
         // Server responded with { requiresCasAuth: true } without items
         if (data.requiresCasAuth) {
+          stampSyncTime();
+          const hasCredentials = Boolean(
+            effectiveAuth.username && effectiveAuth.password
+          );
+          setSyncState(hasCredentials ? 'ok' : 'error');
+          setSyncDetailMessage(
+            hasCredentials
+              ? `Automatyczna aktualizacja planu aktywna (${effectiveAuth.username})`
+              : 'Brak logowania CAS UEK — wpisz login i hasło w „Import z UEK”, aby plan aktualizował się sam z uczelni'
+          );
+
           // If we already have a real schedule for this group in state or localStorage cache, keep it untouched!
           if (hasRealScheduleForSameGroup) {
             return { ok: true, requiresCasAuth: true };
@@ -788,8 +1049,19 @@ export default function App() {
           return { ok: true, requiresCasAuth: true };
         }
 
+        setSyncState('error');
+        setSyncDetailMessage('Pusta odpowiedź serwera podczas pobierania planu.');
         return { ok: false, error: 'Pusta odpowiedź serwera.' };
       } catch {
+        const isOfflineNow =
+          typeof navigator !== 'undefined' && !navigator.onLine;
+        setSyncState(isOfflineNow ? 'offline' : 'error');
+        setSyncDetailMessage(
+          isOfflineNow
+            ? 'Brak internetu (offline) — nie można pobrać zmian, wyświetlam zapisany plan'
+            : 'Nie udało się połączyć z serwerem planu — wyświetlam zapisany plan'
+        );
+
         // Offline or network failure: keep current real schedule or cached schedule for the SAME group entityId
         const prevMeta = metadataRef.current;
         if (
@@ -1451,8 +1723,8 @@ export default function App() {
               : 'border-white/95 shadow-[0_8px_30px_rgba(15,23,42,0.08)]'
           }`}
         >
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5 min-w-0">
+          <div className="min-w-0 flex-1 relative">
+            <div className="flex items-center gap-2 min-w-0">
               {layoutPrefs.headerBadgeIcon && (
                 <span className="text-base sm:text-xl shrink-0">
                   {layoutPrefs.headerBadgeIcon}
@@ -1461,6 +1733,48 @@ export default function App() {
               <h1 className="text-base sm:text-2xl font-bold tracking-tight truncate">
                 {layoutPrefs.customHeaderTitle.trim() || 'Plan zajęć'}
               </h1>
+
+              {/* Mini Status Dot (Green = OK, Yellow = Syncing/Offline, Red = Error/No Auth) */}
+              <button
+                type="button"
+                onClick={() => setIsSyncPopoverOpen((v) => !v)}
+                aria-label="Status automatycznej aktualizacji planu"
+                title={syncDetailMessage}
+                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold border transition-all shrink-0 cursor-pointer ${
+                  syncState === 'ok'
+                    ? isDark
+                      ? 'bg-emerald-500/15 border-emerald-400/35 text-emerald-300 hover:bg-emerald-500/25'
+                      : 'bg-emerald-50 border-emerald-400/50 text-emerald-800 hover:bg-emerald-100'
+                    : syncState === 'syncing' || syncState === 'offline'
+                    ? isDark
+                      ? 'bg-amber-500/15 border-amber-400/35 text-amber-300 hover:bg-amber-500/25'
+                      : 'bg-amber-50 border-amber-400/50 text-amber-800 hover:bg-amber-100'
+                    : isDark
+                    ? 'bg-rose-500/15 border-rose-400/40 text-rose-300 hover:bg-rose-500/25'
+                    : 'bg-rose-50 border-rose-400/50 text-rose-800 hover:bg-rose-100'
+                }`}
+              >
+                <span
+                  className={`w-2 h-2 rounded-full shrink-0 ${
+                    syncState === 'ok'
+                      ? 'bg-emerald-400 shadow-[0_0_8px_#34D399]'
+                      : syncState === 'syncing'
+                      ? 'bg-amber-400 animate-pulse shadow-[0_0_8px_#FBBF24]'
+                      : syncState === 'offline'
+                      ? 'bg-amber-400 shadow-[0_0_8px_#FBBF24]'
+                      : 'bg-rose-500 shadow-[0_0_8px_#F43F5E]'
+                  }`}
+                />
+                <span className="hidden xs:inline sm:inline">
+                  {syncState === 'ok'
+                    ? 'Auto-sync'
+                    : syncState === 'syncing'
+                    ? 'Pobieranie...'
+                    : syncState === 'offline'
+                    ? 'Offline'
+                    : 'Błąd sync'}
+                </span>
+              </button>
             </div>
             <p
               className={`text-[11px] sm:text-xs mt-0.5 truncate ${
@@ -1471,6 +1785,90 @@ export default function App() {
                 metadata.groupFullName ||
                 `UEK Kraków · niestacjonarne · grupa ${metadata.entityId}`}
             </p>
+
+            {/* Popover explaining the Green / Yellow / Red dot */}
+            {isSyncPopoverOpen && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className={`mt-2 p-3.5 rounded-2xl border shadow-2xl text-xs z-50 max-w-[340px] ${
+                  isDark
+                    ? 'bg-[#161922]/98 border-white/15 text-slate-200'
+                    : 'bg-white/98 border-slate-200 text-slate-800'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2 font-bold">
+                    <span
+                      className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                        syncState === 'ok'
+                          ? 'bg-emerald-400 shadow-[0_0_8px_#34D399]'
+                          : syncState === 'syncing' || syncState === 'offline'
+                          ? 'bg-amber-400 shadow-[0_0_8px_#FBBF24]'
+                          : 'bg-rose-500 shadow-[0_0_8px_#F43F5E]'
+                      }`}
+                    />
+                    <span>
+                      {syncState === 'ok'
+                        ? 'Zielony: Plan aktualizuje się automatycznie'
+                        : syncState === 'syncing'
+                        ? 'Żółty: Trwa pobieranie planu z UEK...'
+                        : syncState === 'offline'
+                        ? 'Żółty: Tryb offline (brak internetu)'
+                        : 'Czerwony: Pobieranie nieudane / brak CAS'}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsSyncPopoverOpen(false)}
+                    className="opacity-60 hover:opacity-100"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                <p
+                  className={`mt-1.5 text-[11px] leading-relaxed ${
+                    isDark ? 'text-slate-400' : 'text-slate-600'
+                  }`}
+                >
+                  {syncDetailMessage} (ostatnie sprawdzenie: {lastSyncTimeStr}).
+                </p>
+
+                <div className="mt-2.5 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      fetchSchedule(scheduleUrl);
+                    }}
+                    className={`px-3 py-1.5 rounded-xl text-[11px] font-semibold inline-flex items-center gap-1.5 border transition-colors ${
+                      isDark
+                        ? 'bg-white/10 hover:bg-white/15 border-white/15 text-white'
+                        : 'bg-slate-100 hover:bg-slate-200 border-slate-200 text-slate-800'
+                    }`}
+                  >
+                    <RefreshCw
+                      className={`w-3 h-3 ${
+                        syncState === 'syncing' ? 'animate-spin' : ''
+                      }`}
+                    />
+                    <span>Odśwież teraz</span>
+                  </button>
+                  {syncState === 'error' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsSyncPopoverOpen(false);
+                        setIsImportModalOpen(true);
+                      }}
+                      style={{ backgroundColor: customColors.accentColor }}
+                      className="px-3 py-1.5 rounded-xl text-[11px] font-semibold text-white"
+                    >
+                      Zaloguj CAS
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
@@ -3132,8 +3530,65 @@ export default function App() {
             </p>
 
             {/* Changelog Items */}
-            <div className="mt-5 space-y-3.5 text-xs sm:text-[13px]">
-              {/* Item 1: Orange border for rescheduled */}
+            <div className="mt-5 space-y-3 text-xs sm:text-[13px] max-h-[60vh] overflow-y-auto pr-1">
+              {/* Item 0: Status dot & automatic schedule diff popup */}
+              <div
+                className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
+                  isDark
+                    ? 'bg-emerald-500/10 border-emerald-500/35'
+                    : 'bg-emerald-50/90 border-emerald-300/80'
+                }`}
+              >
+                <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase tracking-wider bg-emerald-500 text-black shrink-0 mt-0.5">
+                  Nowość
+                </span>
+                <div>
+                  <p className="font-bold">
+                    Kropka statusu synchronizacji (🟢/🟡/🔴) i powiadomienia o zmianach w planie
+                  </p>
+                  <p
+                    className={`mt-0.5 text-[11px] leading-relaxed ${
+                      isDark ? 'text-slate-300' : 'text-slate-600'
+                    }`}
+                  >
+                    Obok tytułu <strong>Plan zajęć</strong> dodano znacznik
+                    pokazujący stan pobierania w tle (zielony = działa
+                    poprawnie, żółty = pobieranie / offline, czerwony = błąd /
+                    brak CAS) oraz automatyczny popup, gdy na UEK zmieni się
+                    sala lub termin zajęć.
+                  </p>
+                </div>
+              </div>
+
+              {/* Item 1: Auto CAS re-login & schedule protection */}
+              <div
+                className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
+                  isDark
+                    ? 'bg-sky-500/10 border-sky-500/35'
+                    : 'bg-sky-50/90 border-sky-300/80'
+                }`}
+              >
+                <span className="px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase tracking-wider bg-sky-500 text-black shrink-0 mt-0.5">
+                  Nowość
+                </span>
+                <div>
+                  <p className="font-bold">
+                    Automatyczna aktualizacja planu bez wpisywania hasła
+                  </p>
+                  <p
+                    className={`mt-0.5 text-[11px] leading-relaxed ${
+                      isDark ? 'text-slate-300' : 'text-slate-600'
+                    }`}
+                  >
+                    Wystarczy raz wpisać login i hasło CAS UEK. Gdy wchodzisz na
+                    aplikację po dłuższym czasie, apka sama w tle odnawia sesję,
+                    pobiera najnowsze zmiany z uczelni i chroni Twój plan przed
+                    zresetowaniem.
+                  </p>
+                </div>
+              </div>
+
+              {/* Item 2: Orange border for rescheduled */}
               <div
                 className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
                   isDark
@@ -3161,7 +3616,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Item 2: Link & CAS fix */}
+              {/* Item 3: Link & CAS fix */}
               <div
                 className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
                   isDark
@@ -3189,7 +3644,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Item 3: Removed manual major picker */}
+              {/* Item 4: Removed manual major picker */}
               <div
                 className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
                   isDark
@@ -3232,6 +3687,132 @@ export default function App() {
               className="mt-6 w-full h-[48px] rounded-2xl font-bold text-sm text-white hover:opacity-95 transition-opacity"
             >
               Rozumiem, przejdź do planu
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Modal 6: Automatyczny popup powiadamiający o zmianach wykrytych w samym planie zajęć UEK */}
+      {scheduleDiffAlerts.length > 0 && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/65 backdrop-blur-xl animate-in fade-in duration-200"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="schedule-diff-title"
+          onClick={handleDismissScheduleDiffs}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className={`w-full max-w-[460px] rounded-[32px] p-6 sm:p-7 border shadow-2xl transition-colors ${
+              isDark
+                ? 'bg-[#161922]/95 border-white/15 text-[#F5F5F7]'
+                : 'bg-white/95 border-slate-200/90 text-[#1D1D1F]'
+            }`}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-[11px] font-bold tracking-wide uppercase bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>Wykryto zmiany w planie UEK ({scheduleDiffAlerts.length})</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleDismissScheduleDiffs}
+                aria-label="Zamknij"
+                className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors ${
+                  isDark
+                    ? 'bg-white/10 hover:bg-white/20 text-slate-300'
+                    : 'bg-slate-100 hover:bg-slate-200 text-slate-600'
+                }`}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <h2
+              id="schedule-diff-title"
+              className="mt-3.5 text-xl sm:text-2xl font-bold tracking-tight"
+            >
+              Zmiany w Twoim harmonogramie
+            </h2>
+            <p
+              className={`mt-1 text-xs sm:text-sm ${
+                isDark ? 'text-slate-400' : 'text-slate-600'
+              }`}
+            >
+              Podczas automatycznej synchronizacji z UEK wykryto nowe zmiany w zajęciach:
+            </p>
+
+            <div className="mt-4 space-y-3 max-h-[55vh] overflow-y-auto pr-1 text-xs">
+              {scheduleDiffAlerts.map((alert) => (
+                <div
+                  key={alert.id}
+                  className={`p-3.5 rounded-2xl border ${
+                    alert.kind === 'cancelled'
+                      ? isDark
+                        ? 'bg-rose-500/10 border-rose-500/35'
+                        : 'bg-rose-50 border-rose-300'
+                      : alert.kind === 'rescheduled'
+                      ? isDark
+                        ? 'bg-amber-500/10 border-amber-500/35'
+                        : 'bg-amber-50 border-amber-300'
+                      : isDark
+                      ? 'bg-sky-500/10 border-sky-500/35'
+                      : 'bg-sky-50 border-sky-300'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span
+                      className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase tracking-wider ${
+                        alert.kind === 'cancelled'
+                          ? 'bg-rose-500 text-white'
+                          : alert.kind === 'rescheduled'
+                          ? 'bg-amber-500 text-black'
+                          : 'bg-sky-500 text-black'
+                      }`}
+                    >
+                      {alert.kind === 'cancelled'
+                        ? 'Odwołane'
+                        : alert.kind === 'rescheduled'
+                        ? 'Przeniesione'
+                        : 'Zmiana sali'}
+                    </span>
+                    <span
+                      className={`text-[11px] font-mono tabular-nums ${
+                        isDark ? 'text-slate-400' : 'text-slate-600'
+                      }`}
+                    >
+                      {alert.date} · {alert.time}
+                    </span>
+                  </div>
+                  <p className="mt-2 font-bold text-sm">{alert.subject}</p>
+                  <p className="mt-0.5 font-semibold text-amber-400">
+                    {alert.headline}
+                  </p>
+                  <p
+                    className={`mt-0.5 text-[11px] ${
+                      isDark ? 'text-slate-300' : 'text-slate-600'
+                    }`}
+                  >
+                    {alert.detail}
+                  </p>
+                </div>
+              ))}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleDismissScheduleDiffs}
+              style={{
+                background: `linear-gradient(180deg, ${mixHexColors(
+                  customColors.accentColor,
+                  '#FFFFFF',
+                  0.1
+                )} 0%, ${customColors.accentColor} 100%)`,
+                boxShadow: `inset 0 1px 0 rgba(255,255,255,0.28), 0 6px 20px ${customColors.accentColor}45`,
+              }}
+              className="mt-6 w-full h-[48px] rounded-2xl font-bold text-sm text-white hover:opacity-95 transition-opacity"
+            >
+              Rozumiem
             </button>
           </div>
         </div>
