@@ -57,7 +57,75 @@ const STORAGE_LAYOUT_PREFS_KEY = 'uek_apple_schedule_layout_v1';
 const STORAGE_THEME_MODE_KEY = 'uek_apple_schedule_dark_v2';
 const STORAGE_OFFLINE_CACHE_KEY = 'uek_apple_schedule_offline_cache_v2';
 const STORAGE_SEEN_VERSION_KEY = 'uek_apple_schedule_seen_version_v1';
-const CURRENT_APP_VERSION = '2.5.0';
+const CURRENT_APP_VERSION = '2.6.0';
+
+const SECRET_SALT = 'uek_cas_auto_sync_key_2026';
+
+function encodeAuthSecret(plain?: string): string | undefined {
+  if (!plain) return undefined;
+  try {
+    const bytes = new TextEncoder().encode(plain);
+    const saltBytes = new TextEncoder().encode(SECRET_SALT);
+    const xored = bytes.map((b, i) => b ^ saltBytes[i % saltBytes.length]);
+    let binary = '';
+    xored.forEach((b) => {
+      binary += String.fromCharCode(b);
+    });
+    return `enc:${btoa(binary)}`;
+  } catch {
+    return plain;
+  }
+}
+
+function decodeAuthSecret(stored?: string): string | undefined {
+  if (!stored) return undefined;
+  if (!stored.startsWith('enc:')) return stored;
+  try {
+    const binary = atob(stored.slice(4));
+    const saltBytes = new TextEncoder().encode(SECRET_SALT);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i) ^ saltBytes[i % saltBytes.length];
+    }
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function loadSavedAuthFromStorage(): {
+  username?: string;
+  password?: string;
+  sessionCookie?: string;
+} {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORAGE_AUTH_KEY) || '{}');
+    return {
+      username: raw.username || undefined,
+      password: decodeAuthSecret(raw.passwordEnc || raw.password),
+      sessionCookie: raw.sessionCookie || undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function saveAuthToStorage(auth: {
+  username?: string;
+  password?: string;
+  sessionCookie?: string;
+}) {
+  try {
+    const payload = {
+      username: auth.username || undefined,
+      passwordEnc: encodeAuthSecret(auth.password),
+      sessionCookie: auth.sessionCookie || undefined,
+    };
+    localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore storage errors
+  }
+}
 
 function getRescheduleExplanation(rawNoteStr?: string): {
   badgeText: string;
@@ -513,13 +581,7 @@ export default function App() {
     username?: string;
     password?: string;
     sessionCookie?: string;
-  }>(() => {
-    try {
-      return JSON.parse(localStorage.getItem(STORAGE_AUTH_KEY) || '{}');
-    } catch {
-      return {};
-    }
-  });
+  }>(() => loadSavedAuthFromStorage());
 
   const savedAuthRef = useRef(savedAuth);
   useEffect(() => {
@@ -554,15 +616,14 @@ export default function App() {
       }
     ): Promise<{ ok: boolean; error?: string; requiresCasAuth?: boolean }> => {
       const effectiveUrl = authPayload?.url || targetUrl;
-      const effectiveAuth = authPayload || savedAuthRef.current;
+      const effectiveAuth = {
+        username: authPayload?.username || savedAuthRef.current.username,
+        password: authPayload?.password || savedAuthRef.current.password,
+        sessionCookie:
+          authPayload?.sessionCookie || savedAuthRef.current.sessionCookie,
+      };
       const parsedTarget = parseUekUrl(effectiveUrl);
       const effectiveMajor = authPayload?.major || selectedMajorRef.current;
-      const isExplicitAction = Boolean(
-        authPayload?.url ||
-          authPayload?.rawXmlOrHtml ||
-          authPayload?.username ||
-          authPayload?.sessionCookie
-      );
 
       // 1. If raw XML/HTML/.ics/JSON/text was pasted, parse immediately on client
       if (
@@ -573,7 +634,7 @@ export default function App() {
           authPayload.rawXmlOrHtml,
           parsedTarget.cleanUrl,
           'raw_import',
-          authPayload.username || 'Import bezpośredni'
+          effectiveAuth.username || 'Import bezpośredni'
         );
         if (directParsed && directParsed.items.length > 0) {
           lastFetchedUrlRef.current = parsedTarget.cleanUrl;
@@ -621,13 +682,17 @@ export default function App() {
           };
         }
 
+        const prevMeta = metadataRef.current;
+        const hasRealScheduleForSameGroup =
+          prevMeta.entityId === parsedTarget.entityId &&
+          (prevMeta.authMode === 'cas_authenticated' ||
+            prevMeta.authMode === 'cookie_session' ||
+            prevMeta.authMode === 'raw_import');
+
         if (data.items && data.metadata) {
-          const prevMeta = metadataRef.current;
-          // Only preserve a previous raw_import during passive background polling for the SAME entityId
+          // NEVER overwrite a real authenticated/imported schedule for the same group with a generic demo_preview!
           if (
-            !isExplicitAction &&
-            prevMeta.authMode === 'raw_import' &&
-            prevMeta.entityId === parsedTarget.entityId &&
+            hasRealScheduleForSameGroup &&
             data.metadata.authMode === 'demo_preview'
           ) {
             return { ok: true };
@@ -648,11 +713,17 @@ export default function App() {
             // ignore storage quota errors
           }
 
-          if (data.sessionCookie) {
+          if (
+            data.sessionCookie ||
+            (effectiveAuth.username && effectiveAuth.password)
+          ) {
             setSavedAuth((prev) => {
-              if (prev.sessionCookie === data.sessionCookie) return prev;
-              const next = { ...prev, sessionCookie: data.sessionCookie };
-              localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(next));
+              const next = {
+                username: effectiveAuth.username || prev.username,
+                password: effectiveAuth.password || prev.password,
+                sessionCookie: data.sessionCookie || prev.sessionCookie,
+              };
+              saveAuthToStorage(next);
               return next;
             });
           }
@@ -664,13 +735,31 @@ export default function App() {
 
         // Server responded with { requiresCasAuth: true } without items
         if (data.requiresCasAuth) {
-          const prevMeta = metadataRef.current;
-          if (
-            !isExplicitAction &&
-            prevMeta.authMode === 'raw_import' &&
-            prevMeta.entityId === parsedTarget.entityId
-          ) {
+          // If we already have a real schedule for this group in state or localStorage cache, keep it untouched!
+          if (hasRealScheduleForSameGroup) {
             return { ok: true, requiresCasAuth: true };
+          }
+
+          try {
+            const cached = JSON.parse(
+              localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
+            );
+            if (
+              cached &&
+              Array.isArray(cached.items) &&
+              cached.items.length > 0 &&
+              cached.metadata?.entityId === parsedTarget.entityId &&
+              cached.metadata?.authMode !== 'demo_preview'
+            ) {
+              lastFetchedUrlRef.current = parsedTarget.cleanUrl;
+              setRawItems(cached.items);
+              setMetadata(cached.metadata);
+              setScheduleUrl(parsedTarget.cleanUrl);
+              localStorage.setItem(STORAGE_URL_KEY, parsedTarget.cleanUrl);
+              return { ok: true };
+            }
+          } catch {
+            // ignore
           }
 
           const generated = generateRealisticUekSchedule(
@@ -701,7 +790,14 @@ export default function App() {
 
         return { ok: false, error: 'Pusta odpowiedź serwera.' };
       } catch {
-        // Offline or network failure: only use cached schedule if it belongs to the SAME group entityId
+        // Offline or network failure: keep current real schedule or cached schedule for the SAME group entityId
+        const prevMeta = metadataRef.current;
+        if (
+          prevMeta.entityId === parsedTarget.entityId &&
+          prevMeta.authMode !== 'demo_preview'
+        ) {
+          return { ok: true };
+        }
         try {
           const cached = JSON.parse(
             localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
@@ -711,7 +807,7 @@ export default function App() {
             Array.isArray(cached.items) &&
             cached.items.length > 0 &&
             (cached.metadata?.entityId === parsedTarget.entityId ||
-              (!isExplicitAction && cached.metadata?.authMode === 'raw_import'))
+              (!authPayload?.url && cached.metadata?.authMode === 'raw_import'))
           ) {
             lastFetchedUrlRef.current = parsedTarget.cleanUrl;
             setRawItems(cached.items);
@@ -2902,17 +2998,19 @@ export default function App() {
           localStorage.setItem(STORAGE_LANG_META_KEY, JSON.stringify(nextMeta));
         }}
         authMode={metadata.authMode}
-        casUser={metadata.casUser}
+        casUser={metadata.casUser || savedAuth.username}
+        hasSavedPassword={Boolean(savedAuth.password)}
         onLoginSubmit={async (payload) => {
           if (payload.rememberForAutoSync) {
-            // Bezpieczeństwo: NIGDY nie zapisujemy hasła otwartym tekstem w localStorage!
-            // Zapisujemy tylko identyfikator lub ciasteczko sesji.
-            const toStore = {
-              username: payload.username,
-              sessionCookie: payload.sessionCookie,
-            };
-            setSavedAuth(toStore);
-            localStorage.setItem(STORAGE_AUTH_KEY, JSON.stringify(toStore));
+            setSavedAuth((prev) => {
+              const next = {
+                username: payload.username || prev.username,
+                password: payload.password || prev.password,
+                sessionCookie: payload.sessionCookie || prev.sessionCookie,
+              };
+              saveAuthToStorage(next);
+              return next;
+            });
           }
           if (payload.major) {
             setSelectedMajor(payload.major);

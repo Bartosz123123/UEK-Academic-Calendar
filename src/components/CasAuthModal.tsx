@@ -40,6 +40,7 @@ interface CasAuthModalProps {
   customLangLecturer: string;
   authMode: 'cas_authenticated' | 'cookie_session' | 'raw_import' | 'demo_preview';
   casUser?: string;
+  hasSavedPassword?: boolean;
   onLoginSubmit: (payload: {
     url?: string;
     languageUrl?: string;
@@ -66,6 +67,7 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
   customLangRoom,
   customLangLecturer,
   casUser,
+  hasSavedPassword,
   onLoginSubmit,
   onResetToDefaultSchedule,
 }) => {
@@ -686,6 +688,14 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
 
               {showAdvanced && (
                 <div className="mt-2.5 space-y-2.5 p-3.5 rounded-2xl bg-black/30 border border-white/8 text-xs">
+                  {hasSavedPassword && casUser && (
+                    <div className="p-2.5 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 flex items-center gap-2 text-[11px] font-medium">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>
+                        Dane CAS ({casUser}) są zapamiętane — aplikacja automatycznie odnawia sesję i pobiera najnowszy plan w tle.
+                      </span>
+                    </div>
+                  )}
                   <div>
                     <label className="block text-slate-400 mb-1">
                       Login CAS UEK (np. s234567)
@@ -699,12 +709,18 @@ export const CasAuthModal: React.FC<CasAuthModalProps> = ({
                     />
                   </div>
                   <div>
-                    <label className="block text-slate-400 mb-1">Hasło CAS UEK</label>
+                    <label className="block text-slate-400 mb-1">
+                      Hasło CAS UEK {hasSavedPassword ? '(zapamiętane)' : ''}
+                    </label>
                     <input
                       type="password"
                       value={casPassword}
                       onChange={(e) => setCasPassword(e.target.value)}
-                      placeholder="Hasło uczelniane"
+                      placeholder={
+                        hasSavedPassword
+                          ? '•••••••• (zapamiętane — wpisz tylko jeśli chcesz zmienić)'
+                          : 'Hasło uczelniane'
+                      }
                       className="w-full h-[40px] px-3 rounded-xl bg-[#0D1016] border border-white/12 text-white placeholder:text-slate-500 focus:outline-none"
                     />
                   </div>
