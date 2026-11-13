@@ -633,31 +633,6 @@ function parseUekXmlOrHtml(
       if (tds.length >= 5) {
         const dateCandidate = (tds[0] || '').trim().slice(0, 10);
         if (!/^\d{4}-\d{2}-\d{2}$/.test(dateCandidate)) {
-          const joinedRow = tds.join(' ').trim();
-          if (
-            items.length > 0 &&
-            (joinedRow.toLowerCase().includes('uwagi') ||
-              joinedRow.toLowerCase().includes('przeniesion') ||
-              joinedRow.toLowerCase().includes('odwołan'))
-          ) {
-            const prev = items[items.length - 1];
-            const { combinedNotes } = extractCleanTypeAndNotes(
-              prev.type,
-              prev.rawNotes ? `${prev.rawNotes} · ${joinedRow}` : joinedRow,
-              prev.subject,
-              prev.room
-            );
-            const st = detectStatusFromFields(
-              prev.type,
-              prev.room,
-              combinedNotes,
-              trAttrs,
-              prev.subject
-            );
-            prev.rawNotes = combinedNotes;
-            prev.status = st.status;
-            prev.statusReason = st.statusReason;
-          }
           continue;
         }
 

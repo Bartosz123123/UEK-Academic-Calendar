@@ -1,4 +1,4 @@
-const CACHE_NAME = 'plan-uek-pwa-v12';
+const CACHE_NAME = 'plan-uek-pwa-v14';
 const PRECACHE_ASSETS = [
   '/',
   '/index.html',

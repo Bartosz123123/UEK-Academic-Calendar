@@ -25,6 +25,7 @@ import {
   MajorTrackId,
   UEK_12_ZJAZDY,
   detectMajorFromUrlOrName,
+  detectStatusFromFields,
   enrichScheduleWithLanguageLink,
   generateRealisticUekSchedule,
   getDisplayCategoryLabel,
@@ -59,7 +60,8 @@ const STORAGE_THEME_MODE_KEY = 'uek_apple_schedule_dark_v2';
 const STORAGE_OFFLINE_CACHE_KEY = 'uek_apple_schedule_offline_cache_v2';
 const STORAGE_SEEN_VERSION_KEY = 'uek_apple_schedule_seen_version_v1';
 const STORAGE_SEEN_DIFFS_KEY = 'uek_apple_schedule_seen_diffs_v1';
-const CURRENT_APP_VERSION = '2.8.1';
+const STORAGE_ONBOARDED_KEY = 'uek_apple_schedule_onboarded_v1';
+const CURRENT_APP_VERSION = '2.9.0';
 
 const SYNTHETIC_DEMO_NOTES = new Set([
   'uwagi: na 28.11',
@@ -79,6 +81,7 @@ const SYNTHETIC_DEMO_NOTES = new Set([
 
 function cleanSyntheticRescheduleNotes(items: ScheduleItem[]): ScheduleItem[] {
   return items.map((item) => {
+    if (item.isCustomModified) return item;
     const rawLower = (item.rawNotes || '').trim().toLowerCase();
     const reasonLower = (item.statusReason || '').trim().toLowerCase();
     if (
@@ -89,8 +92,7 @@ function cleanSyntheticRescheduleNotes(items: ScheduleItem[]): ScheduleItem[] {
         !item.id.startsWith('uek-html-') &&
         !item.id.startsWith('uek-ics-') &&
         item.date >= '2026-11-13' &&
-        item.status === 'rescheduled' &&
-        !item.isCustomModified)
+        item.status === 'rescheduled')
     ) {
       return {
         ...item,
@@ -98,6 +100,22 @@ function cleanSyntheticRescheduleNotes(items: ScheduleItem[]): ScheduleItem[] {
         status: 'scheduled',
         statusReason: undefined,
       };
+    }
+    if (item.status === 'rescheduled') {
+      const rechecked = detectStatusFromFields(
+        item.type,
+        item.room,
+        item.rawNotes || '',
+        '',
+        item.subject
+      );
+      if (rechecked.status !== 'rescheduled') {
+        return {
+          ...item,
+          status: rechecked.status,
+          statusReason: rechecked.statusReason,
+        };
+      }
     }
     return item;
   });
@@ -578,16 +596,61 @@ function getWarsawNow(): WarsawClock {
 }
 
 export default function App() {
-  // 1. Schedule URL (defaulting to complete okres=3 link)
+  // 0. Check whether this user has already configured their own UEK schedule link
+  const [isPlanConfigured, setIsPlanConfigured] = useState<boolean>(() => {
+    try {
+      const explicitFlag = localStorage.getItem(STORAGE_ONBOARDED_KEY);
+      if (explicitFlag === 'true') return true;
+      if (explicitFlag === 'false') return false;
+
+      const savedAuthObj = loadSavedAuthFromStorage();
+      if (savedAuthObj.username || savedAuthObj.sessionCookie) {
+        localStorage.setItem(STORAGE_ONBOARDED_KEY, 'true');
+        return true;
+      }
+
+      const cached = JSON.parse(
+        localStorage.getItem(STORAGE_OFFLINE_CACHE_KEY) || 'null'
+      );
+      if (
+        cached &&
+        cached.metadata &&
+        cached.metadata.authMode &&
+        cached.metadata.authMode !== 'demo_preview'
+      ) {
+        localStorage.setItem(STORAGE_ONBOARDED_KEY, 'true');
+        return true;
+      }
+
+      const savedUrl = localStorage.getItem(STORAGE_URL_KEY);
+      if (savedUrl && savedUrl !== DEFAULT_UEK_URL) {
+        localStorage.setItem(STORAGE_ONBOARDED_KEY, 'true');
+        return true;
+      }
+    } catch {
+      // ignore
+    }
+    return false;
+  });
+
+  // 1. Schedule URL (defaulting to saved URL or DEFAULT_UEK_URL)
   const [scheduleUrl, setScheduleUrl] = useState<string>(() => {
     return localStorage.getItem(STORAGE_URL_KEY) || DEFAULT_UEK_URL;
   });
 
-  // 1b. Foreign Language Schedule URL (defaulting to id=153591&okres=3) + optional room/lecturer override
+  // 1b. Foreign Language Schedule URL + optional room/lecturer override
   const [languageUrl, setLanguageUrl] = useState<string>(() => {
     const saved = localStorage.getItem(STORAGE_LANG_URL_KEY);
-    return saved !== null ? saved : DEFAULT_LANGUAGE_UEK_URL;
+    return saved !== null ? saved : '';
   });
+
+  // Inline Welcome Screen form states for new users
+  const [welcomeGroupUrl, setWelcomeGroupUrl] = useState<string>('');
+  const [welcomeLangUrl, setWelcomeLangUrl] = useState<string>('');
+  const [welcomeUsername, setWelcomeUsername] = useState<string>('');
+  const [welcomePassword, setWelcomePassword] = useState<string>('');
+  const [welcomeLoading, setWelcomeLoading] = useState<boolean>(false);
+  const [welcomeError, setWelcomeError] = useState<string | null>(null);
 
   // 1c. Selected major track (defaulting to Finanse i Rachunkowość or detected from URL)
   const [selectedMajor, setSelectedMajor] = useState<MajorTrackId>(() => {
@@ -1196,15 +1259,17 @@ export default function App() {
   );
 
   useEffect(() => {
+    if (!isPlanConfigured) return;
     const clean = parseUekUrl(scheduleUrl).cleanUrl;
     if (lastFetchedUrlRef.current === clean) {
       return;
     }
     fetchSchedule(scheduleUrl);
-  }, [scheduleUrl, fetchSchedule]);
+  }, [isPlanConfigured, scheduleUrl, fetchSchedule]);
 
-  // Automatic background refresh every 5 minutes and on tab focus
+  // Automatic background refresh every 5 minutes and on tab focus (only when user has configured a plan)
   useEffect(() => {
+    if (!isPlanConfigured) return;
     const interval = window.setInterval(() => {
       fetchSchedule(scheduleUrl);
     }, 5 * 60 * 1000);
@@ -1219,7 +1284,79 @@ export default function App() {
       window.clearInterval(interval);
       document.removeEventListener('visibilitychange', onVisChange);
     };
-  }, [scheduleUrl, fetchSchedule]);
+  }, [isPlanConfigured, scheduleUrl, fetchSchedule]);
+
+  const handleWelcomeSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmedUrl = welcomeGroupUrl.trim();
+    if (!trimmedUrl) {
+      setWelcomeError(
+        'Wklej link do swojej grupy ze strony planzajec.uek.krakow.pl (np. https://planzajec.uek.krakow.pl/index.php?typ=G&id=...&okres=3).'
+      );
+      return;
+    }
+    if (
+      !trimmedUrl.includes('uek.krakow.pl') &&
+      !/\bid=\d+/i.test(trimmedUrl) &&
+      !/^\d{4,7}$/.test(trimmedUrl)
+    ) {
+      setWelcomeError(
+        'To nie wygląda na prawidłowy link do planu zajęć UEK. Skopiuj pełny adres grupy z planzajec.uek.krakow.pl.'
+      );
+      return;
+    }
+
+    setWelcomeError(null);
+    setWelcomeLoading(true);
+    try {
+      const normalizedUrl = /^\d{4,7}$/.test(trimmedUrl)
+        ? `https://planzajec.uek.krakow.pl/index.php?typ=G&id=${trimmedUrl}&okres=3`
+        : parseUekUrl(trimmedUrl).cleanUrl;
+
+      if (welcomeLangUrl.trim()) {
+        const cleanLang = /^\d{4,7}$/.test(welcomeLangUrl.trim())
+          ? `https://planzajec.uek.krakow.pl/index.php?typ=G&id=${welcomeLangUrl.trim()}&okres=3`
+          : parseUekUrl(welcomeLangUrl.trim()).cleanUrl;
+        setLanguageUrl(cleanLang);
+        localStorage.setItem(STORAGE_LANG_URL_KEY, cleanLang);
+      }
+
+      if (welcomeUsername.trim() && welcomePassword) {
+        const nextAuth = {
+          username: welcomeUsername.trim(),
+          password: welcomePassword,
+          sessionCookie: savedAuth.sessionCookie,
+        };
+        setSavedAuth(nextAuth);
+        saveAuthToStorage(nextAuth);
+      }
+
+      const detectedMaj = detectMajorFromUrlOrName(normalizedUrl);
+      setSelectedMajor(detectedMaj);
+      localStorage.setItem(STORAGE_MAJOR_KEY, detectedMaj);
+
+      const res = await fetchSchedule(normalizedUrl, {
+        url: normalizedUrl,
+        username: welcomeUsername.trim() || undefined,
+        password: welcomePassword || undefined,
+        major: detectedMaj,
+      });
+
+      if (!res.ok) {
+        setWelcomeError(
+          res.error ||
+            'Nie udało się pobrać planu. Sprawdź link lub login i hasło CAS UEK.'
+        );
+        setWelcomeLoading(false);
+        return;
+      }
+
+      localStorage.setItem(STORAGE_ONBOARDED_KEY, 'true');
+      setIsPlanConfigured(true);
+    } finally {
+      setWelcomeLoading(false);
+    }
+  };
 
   // Merge rawItems with foreign language link (id=153591) and user overrides
   const allItems = useMemo(() => {
@@ -1346,33 +1483,123 @@ export default function App() {
     });
   }, [allItems]);
 
-  // Selected Zjazd ID (defaults to 'z5' = 6–8 LIS)
-  const [selectedZjazdId, setSelectedZjazdId] = useState<string>('z5');
+  // Automatically resolve the active or next upcoming Zjazd based on real-time Warsaw date & time
+  const resolveBestZjazdId = useCallback(
+    (
+      groups: Array<{ id: string; dates: string[] }>,
+      clock: WarsawClock,
+      byDate: Record<string, ScheduleItem[]>
+    ): string => {
+      if (groups.length === 0) return 'z6';
+      for (let i = 0; i < groups.length; i++) {
+        const z = groups[i];
+        const lastDate = z.dates[z.dates.length - 1];
+        if (!lastDate) continue;
+        if (lastDate > clock.dateStr) {
+          return z.id;
+        }
+        if (lastDate === clock.dateStr) {
+          const lastDayClasses = (byDate[lastDate] || []).filter(
+            (item) => item.status !== 'cancelled' && !item.isEndedManually
+          );
+          const hasOngoingOrUpcomingToday =
+            lastDayClasses.length === 0 ||
+            lastDayClasses.some(
+              (item) => parseSeconds(item.endTime) > clock.secondsOfDay
+            );
+          if (hasOngoingOrUpcomingToday) {
+            return z.id;
+          }
+          // Last class of this Zjazd has already ended today -> advance to next Zjazd
+          return groups[i + 1]?.id || z.id;
+        }
+      }
+      return groups[groups.length - 1].id;
+    },
+    []
+  );
 
+  const userManuallyPickedZjazdRef = useRef<boolean>(false);
+  const lastAutoZjazdDateRef = useRef<string>(warsawClock.dateStr);
+  const zjazdyScrollRef = useRef<HTMLDivElement | null>(null);
+
+  const [selectedZjazdId, setSelectedZjazdId] = useState<string>(() =>
+    resolveBestZjazdId(zjazdyGroups, warsawClock, itemsByDate)
+  );
+
+  // Automatically select current/upcoming Zjazd on load, when schedule data updates, or when a new day starts
   useEffect(() => {
-    if (
-      zjazdyGroups.length > 0 &&
-      !zjazdyGroups.some((z) => z.id === selectedZjazdId)
-    ) {
-      const novZjazd = zjazdyGroups.find((z) => z.dates.includes('2026-11-06'));
-      const upcomingZjazd = zjazdyGroups.find((z) =>
-        z.dates.some((d) => d >= warsawClock.dateStr)
-      );
-      setSelectedZjazdId(
-        novZjazd
-          ? novZjazd.id
-          : upcomingZjazd
-          ? upcomingZjazd.id
-          : zjazdyGroups[zjazdyGroups.length - 1].id
-      );
+    if (zjazdyGroups.length === 0) return;
+
+    const dateChanged = lastAutoZjazdDateRef.current !== warsawClock.dateStr;
+    if (dateChanged) {
+      lastAutoZjazdDateRef.current = warsawClock.dateStr;
+      userManuallyPickedZjazdRef.current = false;
     }
-  }, [zjazdyGroups, selectedZjazdId, warsawClock.dateStr]);
+
+    const currentValid = zjazdyGroups.some((z) => z.id === selectedZjazdId);
+    if (!currentValid || !userManuallyPickedZjazdRef.current) {
+      const bestId = resolveBestZjazdId(
+        zjazdyGroups,
+        warsawClock,
+        itemsByDate
+      );
+      if (bestId && bestId !== selectedZjazdId) {
+        setSelectedZjazdId(bestId);
+      }
+    }
+  }, [
+    zjazdyGroups,
+    itemsByDate,
+    warsawClock,
+    selectedZjazdId,
+    resolveBestZjazdId,
+  ]);
+
+  // Also re-align to the current/upcoming Zjazd when user returns to the app on their phone
+  useEffect(() => {
+    const onAppFocus = () => {
+      if (document.visibilityState === 'visible') {
+        const freshClock = getWarsawNow();
+        setWarsawClock(freshClock);
+        userManuallyPickedZjazdRef.current = false;
+        const bestId = resolveBestZjazdId(
+          zjazdyGroups,
+          freshClock,
+          itemsByDate
+        );
+        if (bestId) {
+          setSelectedZjazdId(bestId);
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', onAppFocus);
+    return () => document.removeEventListener('visibilitychange', onAppFocus);
+  }, [zjazdyGroups, itemsByDate, resolveBestZjazdId]);
 
   const activeZjazd = useMemo(() => {
     return (
       zjazdyGroups.find((z) => z.id === selectedZjazdId) || zjazdyGroups[0]
     );
   }, [zjazdyGroups, selectedZjazdId]);
+
+  // Smoothly scroll the horizontal ZJAZDY strip so the active Zjazd pill is centered in view
+  useEffect(() => {
+    const container = zjazdyScrollRef.current;
+    if (!container || !activeZjazd?.id) return;
+    const activeBtn = container.querySelector<HTMLElement>(
+      `[data-zjazd-id="${activeZjazd.id}"]`
+    );
+    if (!activeBtn) return;
+    const targetLeft =
+      activeBtn.offsetLeft -
+      container.clientWidth / 2 +
+      activeBtn.offsetWidth / 2;
+    container.scrollTo({
+      left: Math.max(0, targetLeft),
+      behavior: 'smooth',
+    });
+  }, [activeZjazd?.id]);
 
   // Type & Status Filter ('all' | 'Ćwiczenia' | 'Lektorat' | 'Wykład' | 'odbyte' | 'rescheduled' | 'cancelled')
   const [selectedFilter, setSelectedFilter] = useState<string>('all');
@@ -2033,12 +2260,279 @@ export default function App() {
                   >
                     Ustawienia CAS
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsSyncPopoverOpen(false);
+                      localStorage.setItem(STORAGE_ONBOARDED_KEY, 'false');
+                      setIsPlanConfigured(false);
+                    }}
+                    className={`px-2.5 py-1.5 rounded-xl text-[11px] font-semibold border transition-colors ${
+                      isDark
+                        ? 'bg-white/5 hover:bg-white/10 border-white/10 text-slate-300'
+                        : 'bg-slate-50 hover:bg-slate-100 border-slate-200 text-slate-600'
+                    }`}
+                    title="Pokaż ekran powitalny wyboru własnego planu"
+                  >
+                    Zmień plan
+                  </button>
                 </div>
               </div>
             </>
           )}
         </header>
 
+        {!isPlanConfigured ? (
+          /* Welcome / Onboarding Screen for New Users */
+          <section
+            style={{ backgroundColor: adaptiveCardBg }}
+            className={`${cardRadiusClass} p-5 sm:p-8 border backdrop-blur-2xl transition-colors relative overflow-hidden ${
+              isDark
+                ? 'border-white/12 shadow-2xl'
+                : 'border-white shadow-[0_12px_40px_rgba(15,23,42,0.08)]'
+            }`}
+          >
+            <div
+              style={{
+                background: `radial-gradient(circle, ${customColors.accentColor}28 0%, transparent 70%)`,
+              }}
+              className="w-72 h-72 rounded-full absolute -top-24 -right-20 pointer-events-none"
+            />
+
+            <div className="relative z-10 max-w-xl mx-auto">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full text-[11px] font-bold uppercase tracking-wider border mb-3.5 bg-sky-500/12 border-sky-400/30 text-sky-400">
+                <span>🎓</span>
+                <span>Witaj w aplikacji Plan UEK</span>
+              </div>
+
+              <h2 className="text-2xl sm:text-3xl font-bold tracking-tight">
+                Dodaj link do własnego planu zajęć
+              </h2>
+              <p
+                className={`mt-2 text-xs sm:text-sm leading-relaxed ${
+                  isDark ? 'text-slate-300' : 'text-slate-600'
+                }`}
+              >
+                Zamiast wyświetlać cudzy plan zajęć, wklej poniżej link do swojej
+                grupy ze strony{' '}
+                <strong className="font-semibold">
+                  planzajec.uek.krakow.pl
+                </strong>
+                . Aplikacja ułoży Twój harmonogram w zjazdy, policzy postęp
+                semestru i będzie automatycznie sprawdzać zmiany w tle.
+              </p>
+
+              {/* Step-by-step mini guide */}
+              <div
+                className={`mt-5 p-4 rounded-2xl border space-y-2.5 text-xs ${
+                  isDark
+                    ? 'bg-white/[0.03] border-white/10 text-slate-300'
+                    : 'bg-slate-50/90 border-slate-200/80 text-slate-700'
+                }`}
+              >
+                <p className="font-bold text-[11px] uppercase tracking-wider opacity-75">
+                  Jak skopiować swój link w 30 sekund:
+                </p>
+                <div className="flex items-start gap-2.5">
+                  <span
+                    style={{ backgroundColor: customColors.accentColor }}
+                    className="w-5 h-5 rounded-full text-white font-bold text-[11px] flex items-center justify-center shrink-0 mt-0.5"
+                  >
+                    1
+                  </span>
+                  <span>
+                    Wejdź na{' '}
+                    <a
+                      href="https://planzajec.uek.krakow.pl"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: customColors.accentColor }}
+                      className="font-bold underline"
+                    >
+                      planzajec.uek.krakow.pl
+                    </a>{' '}
+                    i wybierz swoją grupę dziekańską oraz pełny semestr.
+                  </span>
+                </div>
+                <div className="flex items-start gap-2.5">
+                  <span
+                    style={{ backgroundColor: customColors.accentColor }}
+                    className="w-5 h-5 rounded-full text-white font-bold text-[11px] flex items-center justify-center shrink-0 mt-0.5"
+                  >
+                    2
+                  </span>
+                  <span>
+                    Skopiuj link z paska adresu przeglądarki (np.{' '}
+                    <code className="px-1.5 py-0.5 rounded bg-black/20 font-mono text-[10px]">
+                      https://planzajec.uek.krakow.pl/index.php?typ=G&amp;id=...&amp;okres=3
+                    </code>
+                    ).
+                  </span>
+                </div>
+                <div className="flex items-start gap-2.5">
+                  <span
+                    style={{ backgroundColor: customColors.accentColor }}
+                    className="w-5 h-5 rounded-full text-white font-bold text-[11px] flex items-center justify-center shrink-0 mt-0.5"
+                  >
+                    3
+                  </span>
+                  <span>
+                    Wklej go poniżej i (opcjonalnie) wpisz login i hasło CAS UEK,
+                    aby plan aktualizował się automatycznie w tle.
+                  </span>
+                </div>
+              </div>
+
+              <form onSubmit={handleWelcomeSubmit} className="mt-5 space-y-3.5">
+                <div>
+                  <label className="block text-xs font-bold mb-1.5">
+                    1. Link do Twojej grupy dziekańskiej UEK (wymagany)
+                  </label>
+                  <input
+                    type="text"
+                    value={welcomeGroupUrl}
+                    onChange={(e) => setWelcomeGroupUrl(e.target.value)}
+                    placeholder="https://planzajec.uek.krakow.pl/index.php?typ=G&id=...&okres=3"
+                    className={`w-full px-3.5 py-2.5 rounded-xl border text-xs sm:text-sm font-mono focus:outline-none transition-colors ${
+                      isDark
+                        ? 'bg-black/30 border-white/15 text-white placeholder:text-slate-500 focus:border-sky-400'
+                        : 'bg-white border-slate-300 text-slate-900 placeholder:text-slate-400 focus:border-sky-500'
+                    }`}
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold mb-1.5">
+                    2. Link do grupy językowej / lektoratu (opcjonalnie)
+                  </label>
+                  <input
+                    type="text"
+                    value={welcomeLangUrl}
+                    onChange={(e) => setWelcomeLangUrl(e.target.value)}
+                    placeholder="https://planzajec.uek.krakow.pl/index.php?typ=G&id=...&okres=3"
+                    className={`w-full px-3.5 py-2.5 rounded-xl border text-xs sm:text-sm font-mono focus:outline-none transition-colors ${
+                      isDark
+                        ? 'bg-black/30 border-white/15 text-white placeholder:text-slate-500 focus:border-sky-400'
+                        : 'bg-white border-slate-300 text-slate-900 placeholder:text-slate-400 focus:border-sky-500'
+                    }`}
+                  />
+                </div>
+
+                <div
+                  className={`p-3.5 rounded-2xl border space-y-2.5 ${
+                    isDark
+                      ? 'bg-white/[0.03] border-white/10'
+                      : 'bg-slate-50/80 border-slate-200/80'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold">
+                      3. Logowanie CAS UEK (do auto-aktualizacji w tle)
+                    </span>
+                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                      Zalecane
+                    </span>
+                  </div>
+                  <p
+                    className={`text-[11px] leading-relaxed ${
+                      isDark ? 'text-slate-400' : 'text-slate-500'
+                    }`}
+                  >
+                    Wpisz jednorazowo swój login i hasło CAS, aby aplikacja sama
+                    pobierała z uczelni przeniesione i odwołane zajęcia bez
+                    ponownego pytania o hasło.
+                  </p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <input
+                      type="text"
+                      value={welcomeUsername}
+                      onChange={(e) => setWelcomeUsername(e.target.value)}
+                      placeholder="Login / nr albumu (np. s234567)"
+                      autoComplete="username"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs focus:outline-none ${
+                        isDark
+                          ? 'bg-black/30 border-white/15 text-white placeholder:text-slate-500'
+                          : 'bg-white border-slate-300 text-slate-900 placeholder:text-slate-400'
+                      }`}
+                    />
+                    <input
+                      type="password"
+                      value={welcomePassword}
+                      onChange={(e) => setWelcomePassword(e.target.value)}
+                      placeholder="Hasło CAS UEK"
+                      autoComplete="current-password"
+                      className={`w-full px-3 py-2 rounded-xl border text-xs focus:outline-none ${
+                        isDark
+                          ? 'bg-black/30 border-white/15 text-white placeholder:text-slate-500'
+                          : 'bg-white border-slate-300 text-slate-900 placeholder:text-slate-400'
+                      }`}
+                    />
+                  </div>
+                </div>
+
+                {welcomeError && (
+                  <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/35 text-rose-300 text-xs font-medium">
+                    {welcomeError}
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  disabled={welcomeLoading}
+                  style={{
+                    background: `linear-gradient(180deg, ${mixHexColors(
+                      customColors.accentColor,
+                      '#FFFFFF',
+                      0.1
+                    )} 0%, ${customColors.accentColor} 100%)`,
+                    boxShadow: `inset 0 1px 0 rgba(255,255,255,0.28), 0 8px 20px -4px ${customColors.accentColor}55`,
+                  }}
+                  className="w-full py-3 px-5 rounded-2xl font-bold text-sm text-white hover:opacity-95 transition-opacity flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+                >
+                  {welcomeLoading ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                      <span>Wczytywanie Twojego planu z UEK...</span>
+                    </>
+                  ) : (
+                    <span>Wczytaj mój plan zajęć →</span>
+                  )}
+                </button>
+              </form>
+
+              <div className="mt-4 pt-4 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setIsImportModalOpen(true)}
+                  className={`w-full sm:w-auto py-2 px-3.5 rounded-xl font-semibold border transition-colors ${
+                    isDark
+                      ? 'bg-white/6 hover:bg-white/12 border-white/12 text-slate-200'
+                      : 'bg-slate-100 hover:bg-slate-200 border-slate-200 text-slate-700'
+                  }`}
+                >
+                  Inne metody importu (Schowek / XML / .ics)
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    localStorage.setItem(STORAGE_ONBOARDED_KEY, 'true');
+                    setIsPlanConfigured(true);
+                    fetchSchedule(scheduleUrl);
+                  }}
+                  className={`w-full sm:w-auto py-2 px-3.5 rounded-xl font-medium transition-colors ${
+                    isDark
+                      ? 'text-slate-400 hover:text-white'
+                      : 'text-slate-500 hover:text-slate-900'
+                  }`}
+                >
+                  Zobacz przykładowy plan (Demo)
+                </button>
+              </div>
+            </div>
+          </section>
+        ) : (
+          <>
         {/* Custom Countdown Banner (if configured by the user in Studio Personalizacji) */}
         {(layoutPrefs.countdownLabel || layoutPrefs.countdownDate) && (
           <div
@@ -2406,7 +2900,10 @@ export default function App() {
                   const idx = zjazdyGroups.findIndex(
                     (z) => z.id === selectedZjazdId
                   );
-                  if (idx > 0) setSelectedZjazdId(zjazdyGroups[idx - 1].id);
+                  if (idx > 0) {
+                    userManuallyPickedZjazdRef.current = true;
+                    setSelectedZjazdId(zjazdyGroups[idx - 1].id);
+                  }
                 }}
                 className={`transition-colors ${
                   isDark
@@ -2424,6 +2921,7 @@ export default function App() {
                     (z) => z.id === selectedZjazdId
                   );
                   if (idx >= 0 && idx < zjazdyGroups.length - 1) {
+                    userManuallyPickedZjazdRef.current = true;
                     setSelectedZjazdId(zjazdyGroups[idx + 1].id);
                   }
                 }}
@@ -2435,14 +2933,19 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2 overflow-x-auto pb-2.5 pt-1">
+          <div
+            ref={zjazdyScrollRef}
+            className="flex items-center gap-2 overflow-x-auto pb-2.5 pt-1"
+          >
             {zjazdyGroups.map((z) => {
               const isSelected = z.id === activeZjazd?.id;
               return (
                 <button
                   key={z.id}
+                  data-zjazd-id={z.id}
                   type="button"
                   onClick={() => {
+                    userManuallyPickedZjazdRef.current = true;
                     setSelectedZjazdId(z.id);
                     if (selectedFilter === 'odbyte') {
                       setSelectedFilter('all');
@@ -3451,6 +3954,8 @@ export default function App() {
             );
           })}
         </section>
+          </>
+        )}
       </div>
 
       {/* Modal 1: Import planu z UEK (Grupa dziekańska + Język obcy) */}
@@ -3461,6 +3966,8 @@ export default function App() {
         onUpdateUrl={(newUrl) => {
           setScheduleUrl(newUrl);
           localStorage.setItem(STORAGE_URL_KEY, newUrl);
+          localStorage.setItem(STORAGE_ONBOARDED_KEY, 'true');
+          setIsPlanConfigured(true);
         }}
         selectedMajor={selectedMajor}
         onSelectMajor={(major) => {
@@ -3503,7 +4010,12 @@ export default function App() {
             setSelectedMajor(payload.major);
             localStorage.setItem(STORAGE_MAJOR_KEY, payload.major);
           }
-          return fetchSchedule(payload.url || scheduleUrl, payload);
+          const res = await fetchSchedule(payload.url || scheduleUrl, payload);
+          if (res.ok) {
+            localStorage.setItem(STORAGE_ONBOARDED_KEY, 'true');
+            setIsPlanConfigured(true);
+          }
+          return res;
         }}
         onResetToDefaultSchedule={() => {
           setSelectedMajor('informatyka');
@@ -3620,7 +4132,7 @@ export default function App() {
 
             {/* Changelog Items */}
             <div className="mt-5 space-y-3 text-xs sm:text-[13px] max-h-[60vh] overflow-y-auto pr-1">
-              {/* Item 0: Status dot, mobile header layout & accurate reschedule notes */}
+              {/* Item 0: Welcome screen for new users + automatic Zjazd week selection */}
               <div
                 className={`p-3.5 rounded-2xl border flex items-start gap-3 ${
                   isDark
@@ -3633,18 +4145,18 @@ export default function App() {
                 </span>
                 <div>
                   <p className="font-bold">
-                    Poprawiony nagłówek mobilny, pływające okienko statusu (🟢/🟡/🔴) i dokładne przeniesienia
+                    Ekran powitalny dla nowych użytkowników + automatyczny tydzień zjazdu (13–15 LIS)
                   </p>
                   <p
                     className={`mt-0.5 text-[11px] leading-relaxed ${
                       isDark ? 'text-slate-300' : 'text-slate-600'
                     }`}
                   >
-                    Naprawiono układ górnego paska na telefonach (tytuł i
-                    przyciski mają dedykowane miejsce bez nachodzenia na siebie),
-                    pływające okienko po kliknięciu w kropkę statusu oraz
-                    usunięto błędne oznaczenia przeniesionych zajęć (np. z
-                    28.11), które nie występowały w internetowym planie UEK.
+                    Gdy ktoś nowy otwiera Twoją aplikację po raz pierwszy,
+                    zamiast sztywnego planu z góry widzi ekran powitalny z
+                    miejscem na wklejenie linku do własnej grupy UEK. Dodatkowo
+                    aplikacja automatycznie zaznacza aktualny zjazd (np.{' '}
+                    <strong>13–15 LIS</strong>).
                   </p>
                 </div>
               </div>
